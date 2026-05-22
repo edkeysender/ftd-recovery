@@ -2,8 +2,8 @@ import struct
 from app import dhcp_namesniffer as sn
 
 
-def build_dhcp_request_with_hostname(hostname: bytes, mac: bytes) -> bytes:
-    """Build a minimal DHCPREQUEST payload (op=BOOTREQUEST, with option 12)."""
+def build_dhcp_request_with_hostname(hostname: bytes, mac: bytes, include_hostname: bool = True) -> bytes:
+    """Build a minimal DHCPREQUEST payload (op=BOOTREQUEST, with optional option 12)."""
     # op=1 (BOOTREQUEST), htype=1, hlen=6, hops=0
     header = bytes([1, 1, 6, 0])
     xid = b"\x00\x00\x00\x01"
@@ -16,8 +16,10 @@ def build_dhcp_request_with_hostname(hostname: bytes, mac: bytes) -> bytes:
     sname = b"\x00" * 64
     file_ = b"\x00" * 128
     magic = sn.DHCP_MAGIC
-    # option 53 = DHCPREQUEST (type 3), option 12 = hostname, end 0xff
-    options = bytes([53, 1, 3, 12, len(hostname)]) + hostname + bytes([0xff])
+    if include_hostname:
+        options = bytes([53, 1, 3, 12, len(hostname)]) + hostname + bytes([0xff])
+    else:
+        options = bytes([53, 1, 3, 0xff])
     return header + xid + secs_flags + ciaddr + yiaddr + siaddr + giaddr + chaddr + sname + file_ + magic + options
 
 
@@ -36,17 +38,19 @@ def test_parse_dhcp_extracts_hostname_and_mac_and_ip():
 
 def test_parse_dhcp_returns_none_for_packet_without_option_12():
     mac = bytes([0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33])
-    # build payload with no option 12 present
-    header = bytes([1, 1, 6, 0]) + b"\x00\x00\x00\x01" + b"\x00\x00\x80\x00"
-    body = (b"\x00" * 16) + mac + b"\x00" * 10 + b"\x00" * 192 + sn.DHCP_MAGIC
-    options_no_12 = bytes([53, 1, 3, 0xff])
-    payload = header + body + options_no_12
-
+    payload = build_dhcp_request_with_hostname(b"", mac, include_hostname=False)
     assert sn.parse_dhcp(payload) is None
 
 
 def test_parse_dhcp_rejects_truncated_payload():
     assert sn.parse_dhcp(b"\x00" * 50) is None
+
+
+def test_parse_dhcp_rejects_invalid_hostname():
+    mac = bytes([0xaa, 0xbb, 0xcc, 0x11, 0x22, 0x33])
+    # Hostname with HTML/control chars — should be rejected by _VALID_HOSTNAME_RE
+    payload = build_dhcp_request_with_hostname(b"<script>", mac)
+    assert sn.parse_dhcp(payload) is None
 
 
 def test_parse_nbns_still_works():
