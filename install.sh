@@ -84,6 +84,22 @@ if [[ -z "$INTERFACE" ]]; then
 fi
 INTERFACE=$(ask_interface "Network interface for PXE/dnsmasq" "${INTERFACE:-eth0}")
 
+# Refuse silently using the corporate uplink: if the chosen iface is the
+# default-route NIC, proxy-DHCP on it will answer PXE on whatever network
+# is upstream (typically the corporate LAN), which interferes with the
+# real DHCP server. Make the operator explicitly opt in.
+DEFAULT_ROUTE_IFACE=$(detect_default_iface || true)
+if [[ -n "$DEFAULT_ROUTE_IFACE" && "$DEFAULT_ROUTE_IFACE" == "$INTERFACE" ]]; then
+    warn "Interface '$INTERFACE' is the default-route NIC."
+    warn "Proxy-DHCP on this NIC will answer PXE on whatever network is"
+    warn "upstream (often the corporate LAN). This interferes with other"
+    warn "DHCP servers and is almost certainly not what you want unless"
+    warn "this Pi is on a dedicated, isolated PXE LAN."
+    if ! confirm "Continue with $INTERFACE despite the warning?" "n"; then
+        die "Aborting. Re-run install.sh and pick an isolated PXE interface."
+    fi
+fi
+
 # Auto-detect IP and subnet from the chosen interface; CLI/env values win.
 DETECTED_IP=$(detect_iface_ip "$INTERFACE" || true)
 DETECTED_CIDR=$(detect_iface_cidr "$INTERFACE" 2>/dev/null || true)
