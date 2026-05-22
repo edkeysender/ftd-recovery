@@ -21,7 +21,8 @@ IPXE_DIR = Path("/srv/tftp")
 ALLOWLIST_HELPER = "/usr/local/bin/recovery-allowlist"
 BACKUP_STORAGE = "/srv/clonezilla-images"
 
-_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
+_SAFE_NAME_PAT = r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$"
+_SAFE_NAME_RE = re.compile(_SAFE_NAME_PAT)
 
 
 def _safe_name(candidate) -> str:
@@ -782,7 +783,7 @@ async def delete_image(name: str):
 
 
 class NameUpdate(BaseModel):
-    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
+    name: str = Field(min_length=1, max_length=64, pattern=_SAFE_NAME_PAT)
 
 
 @app.put("/api/host/{ip}/name")
@@ -799,7 +800,7 @@ async def update_name(ip: str, payload: NameUpdate):
 class HostEntry(BaseModel):
     host: str
     mac: str
-    name: Optional[str] = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
+    name: Optional[str] = Field(default=None, max_length=64, pattern=_SAFE_NAME_PAT)
 
 
 class HostBatchAdd(BaseModel):
@@ -1980,14 +1981,14 @@ async function openAddDevicesPicker(btn) {
     if (warnings.replaced.length) {
       parts.push('<strong>⚠ MAC address changed at these IPs — hardware was swapped:</strong>');
       parts.push(warnings.replaced.map(r =>
-        `&nbsp;&nbsp;${r.host}: ${r.old_mac} → ${r.new_mac} (was &quot;${r.old_name}&quot;, now &quot;${r.new_name}&quot;)`
+        `&nbsp;&nbsp;${escapeHtml(r.host)}: ${escapeHtml(r.old_mac)} → ${escapeHtml(r.new_mac)} (was "${escapeHtml(r.old_name)}", now "${escapeHtml(r.new_name)}")`
       ).join('<br>'));
     }
     if (warnings.removed.length) {
       if (parts.length) parts.push('<br>');
       parts.push('<strong>Removed duplicate entries (same MAC as another host):</strong>');
       parts.push(warnings.removed.map(r =>
-        `&nbsp;&nbsp;${r.host} (&quot;${r.name}&quot;) — ${r.reason}; kept ${r.kept_host}`
+        `&nbsp;&nbsp;${escapeHtml(r.host)} ("${escapeHtml(r.name)}") — ${escapeHtml(r.reason)}; kept ${escapeHtml(r.kept_host)}`
       ).join('<br>'));
     }
     parts.push(' <button class="banner-dismiss" type="button">dismiss</button>');
