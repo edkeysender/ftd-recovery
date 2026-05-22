@@ -6,13 +6,13 @@ FastAPI web UI running on a Raspberry Pi.
 ## One-line install
 
 ```bash
-curl -fsSL https://YOUR-HOST/ftd-recovery/install.sh | sudo bash
+curl -fsSL https://github.com/edkeysender/ftd-recovery/raw/main/install.sh | sudo bash
 ```
 
 Or, if cloning the repo:
 
 ```bash
-git clone https://YOUR-HOST/ftd-recovery.git
+git clone https://github.com/edkeysender/ftd-recovery.git
 cd ftd-recovery
 sudo ./install.sh
 ```

@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
 # FTD Recovery installer.
 # Usage: sudo ./install.sh [--prefix PATH] [--user NAME] [--interface IF] [--server-ip IP]
+#   or:  curl -fsSL https://github.com/edkeysender/ftd-recovery/raw/main/install.sh | sudo bash
 #
 # Default install prefix: /ftd/product/FTDRecovery
 # Default service user:   ftd
 
 set -euo pipefail
+
+# When piped through `curl | bash`, BASH_SOURCE is empty and the lib/ files we
+# need to source don't exist on disk — bootstrap by fetching the repo tarball
+# and re-execing this installer from there.
+if [[ -z "${BASH_SOURCE[0]:-}" || ! -f "${BASH_SOURCE[0]:-}" ]]; then
+    REPO_URL="${FTD_RECOVERY_REPO_URL:-https://github.com/edkeysender/ftd-recovery}"
+    REPO_REF="${FTD_RECOVERY_REPO_REF:-main}"
+    BOOTSTRAP_DIR="$(mktemp -d -t ftd-recovery-XXXXXX)"
+    echo "Fetching $REPO_URL @ $REPO_REF → $BOOTSTRAP_DIR"
+    curl -fsSL "$REPO_URL/archive/refs/heads/$REPO_REF.tar.gz" \
+        | tar -xz -C "$BOOTSTRAP_DIR" --strip-components=1
+    exec bash "$BOOTSTRAP_DIR/install.sh" "$@"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
