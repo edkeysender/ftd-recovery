@@ -84,16 +84,24 @@ if [[ -z "$INTERFACE" ]]; then
 fi
 INTERFACE=$(ask_interface "Network interface for PXE/dnsmasq" "${INTERFACE:-eth0}")
 
-if [[ -z "$SERVER_IP" ]]; then
-    SERVER_IP=$(detect_iface_ip "$INTERFACE" || true)
-fi
-SERVER_IP=$(ask "This Pi's static IP on $INTERFACE (clients fetch boot files from here)" "${SERVER_IP:-}")
-[[ -z "$SERVER_IP" ]] && die "server IP is required"
+# Auto-detect IP and subnet from the chosen interface; CLI/env values win.
+DETECTED_IP=$(detect_iface_ip "$INTERFACE" || true)
+DETECTED_CIDR=$(detect_iface_cidr "$INTERFACE" 2>/dev/null || true)
+SERVER_IP="${SERVER_IP:-$DETECTED_IP}"
+SUBNET_CIDR="${SUBNET_CIDR:-$DETECTED_CIDR}"
 
-if [[ -z "$SUBNET_CIDR" ]]; then
-    SUBNET_CIDR=$(detect_iface_cidr "$INTERFACE" 2>/dev/null || echo "")
+if [[ -n "$SERVER_IP" && -n "$SUBNET_CIDR" ]]; then
+    echo "${DIM}Detected:  server-ip=${SERVER_IP}  subnet=${SUBNET_CIDR}${RESET}"
+    if ! confirm "Use detected network config?" "y"; then
+        SERVER_IP=$(ask "This Pi's static IP on $INTERFACE (clients fetch boot files from here)" "$SERVER_IP")
+        SUBNET_CIDR=$(ask "Subnet CIDR served by proxy-DHCP" "$SUBNET_CIDR")
+    fi
+else
+    SERVER_IP=$(ask "This Pi's static IP on $INTERFACE (clients fetch boot files from here)" "$SERVER_IP")
+    SUBNET_CIDR=$(ask "Subnet CIDR served by proxy-DHCP" "$SUBNET_CIDR")
 fi
-SUBNET_CIDR=$(ask "Subnet CIDR served by proxy-DHCP" "${SUBNET_CIDR:-}")
+
+[[ -z "$SERVER_IP" ]] && die "server IP is required"
 [[ -z "$SUBNET_CIDR" ]] && die "subnet CIDR is required"
 SUBNET_BASE=$(subnet_base "$SUBNET_CIDR")
 
