@@ -82,7 +82,7 @@ ok "system packages installed"
 if [[ -z "$INTERFACE" ]]; then
     INTERFACE=$(detect_default_iface || true)
 fi
-INTERFACE=$(ask "Network interface for PXE/dnsmasq" "${INTERFACE:-eth0}")
+INTERFACE=$(ask_interface "Network interface for PXE/dnsmasq" "${INTERFACE:-eth0}")
 
 if [[ -z "$SERVER_IP" ]]; then
     SERVER_IP=$(detect_iface_ip "$INTERFACE" || true)

@@ -33,6 +33,65 @@ ask() {
     fi
 }
 
+# ask_interface "Question" "default-name" → echoes the chosen interface name.
+# Shows a numbered list of candidate interfaces (excluding loopback and common
+# virtual ones) with link state and current IPv4. Accepts either the number or
+# the interface name. Falls back to plain ask() if no interfaces are detected.
+ask_interface() {
+    local prompt=$1 default=${2:-} reply name state ipv4 i default_idx=0
+    local -a names=()
+
+    mapfile -t names < <(
+        ip -o link show 2>/dev/null \
+            | awk -F': ' '$2 !~ /^(lo|docker|veth|br-|tun|tap|wg|virbr|cni|flannel)/ {
+                  n=$2; sub(/@.*/, "", n); print n
+              }'
+    )
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+        ask "$prompt" "$default"
+        return
+    fi
+
+    {
+        echo
+        echo "${DIM}Available interfaces:${RESET}"
+        for i in "${!names[@]}"; do
+            name=${names[$i]}
+            state=$(cat "/sys/class/net/$name/operstate" 2>/dev/null || echo "?")
+            ipv4=$(ip -4 -o addr show dev "$name" 2>/dev/null \
+                       | awk '{print $4}' | paste -sd' ' -)
+            [[ -z "$ipv4" ]] && ipv4="${DIM}(no IPv4)${RESET}"
+            printf "  %s%d)%s %-10s  %-6s  %s\n" "$BOLD" "$((i+1))" "$RESET" "$name" "$state" "$ipv4"
+            [[ "$name" == "$default" ]] && default_idx=$((i+1))
+        done
+        echo
+    } >&2
+
+    # If caller's default isn't in the list, pick the first UP iface as default.
+    if [[ $default_idx -eq 0 ]]; then
+        for i in "${!names[@]}"; do
+            if [[ "$(cat "/sys/class/net/${names[$i]}/operstate" 2>/dev/null)" == "up" ]]; then
+                default_idx=$((i+1)); default=${names[$i]}; break
+            fi
+        done
+    fi
+    [[ $default_idx -eq 0 ]] && { default_idx=1; default=${names[0]}; }
+
+    while :; do
+        read -r -p "${BOLD}${prompt}${RESET} [${default_idx}=${default}]: " reply </dev/tty
+        reply=${reply:-$default_idx}
+        if [[ "$reply" =~ ^[0-9]+$ ]]; then
+            if (( reply >= 1 && reply <= ${#names[@]} )); then
+                echo "${names[$((reply-1))]}"; return 0
+            fi
+        elif [[ -d "/sys/class/net/$reply" ]]; then
+            echo "$reply"; return 0
+        fi
+        warn "not a valid interface; pick a number 1-${#names[@]} or type an interface name"
+    done
+}
+
 # confirm "Question" "y|n" → 0 if yes, 1 if no
 confirm() {
     local prompt=$1 default=${2:-n} reply
