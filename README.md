@@ -61,6 +61,16 @@ showmount -e localhost
 
 ## Uninstall
 
+One-line (same self-bootstrap as the installer):
+
+```bash
+curl -fsSL https://github.com/edkeysender/ftd-recovery/raw/main/uninstall.sh | sudo bash
+# or with storage purge:
+curl -fsSL https://github.com/edkeysender/ftd-recovery/raw/main/uninstall.sh | sudo bash -s -- --purge-storage
+```
+
+From a clone:
+
 ```bash
 sudo ./uninstall.sh                    # keeps backup data and the bind mount
 sudo ./uninstall.sh --purge-storage    # also removes the bind mount and fstab line

@@ -2,8 +2,24 @@
 # FTD Recovery uninstaller.
 # Removes services, configs, and app files. Backup data is preserved by default.
 # Pass --purge-storage to also unmount and remove the bind mount + fstab entries.
+#
+# Usage: sudo ./uninstall.sh [--purge-storage]
+#   or:  curl -fsSL https://github.com/edkeysender/ftd-recovery/raw/main/uninstall.sh | sudo bash
 
 set -euo pipefail
+
+# When piped through `curl | bash`, BASH_SOURCE is empty and lib/common.sh
+# isn't on disk — bootstrap by fetching the repo tarball and re-execing.
+if [[ -z "${BASH_SOURCE[0]:-}" || ! -f "${BASH_SOURCE[0]:-}" ]]; then
+    REPO_URL="${FTD_RECOVERY_REPO_URL:-https://github.com/edkeysender/ftd-recovery}"
+    REPO_REF="${FTD_RECOVERY_REPO_REF:-main}"
+    BOOTSTRAP_DIR="$(mktemp -d -t ftd-recovery-XXXXXX)"
+    echo "Fetching $REPO_URL @ $REPO_REF → $BOOTSTRAP_DIR"
+    curl -fsSL "$REPO_URL/archive/refs/heads/$REPO_REF.tar.gz" \
+        | tar -xz -C "$BOOTSTRAP_DIR" --strip-components=1
+    exec bash "$BOOTSTRAP_DIR/uninstall.sh" "$@"
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 require_root
