@@ -50,6 +50,7 @@ PING_TIMEOUT = 1
 HOSTNAME_TTL = 300
 ARM_TTL = 300  # 5 minutes
 PROGRESS_TTL = 120  # progress entries older than this are stale and hidden
+INTERFACE = os.environ.get("RECOVERY_IFACE", "eth0")
 
 Mode = Literal["recovery", "backup"]
 MODE_TO_IPXE_FILE = {
@@ -1140,10 +1141,10 @@ async def wsd_discover_names(source_ip: str) -> dict[str, str]:
 
 
 async def arp_scan_subnet() -> list[tuple[str, str]]:
-    """Return [(ip, mac), ...] for live hosts on eth0's local subnet."""
+    """Return [(ip, mac), ...] for live hosts on the configured interface's local subnet."""
     proc = await asyncio.create_subprocess_exec(
         "sudo", "-n", "/usr/sbin/arp-scan",
-        "--interface=eth0", "--localnet", "--quiet", "--plain",
+        f"--interface={INTERFACE}", "--localnet", "--quiet", "--plain",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

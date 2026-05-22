@@ -233,7 +233,8 @@ ok "NFS export active"
 # ── Step 10: systemd units ──────────────────────────────────────────────────
 log "installing systemd units"
 render "$SCRIPT_DIR/systemd/recovery-interface.service" /etc/systemd/system/recovery-interface.service 0644 \
-    "INSTALL_PREFIX=$INSTALL_PREFIX" "SERVICE_USER=$SERVICE_USER"
+    "INSTALL_PREFIX=$INSTALL_PREFIX" "SERVICE_USER=$SERVICE_USER" \
+    "INTERFACE=$INTERFACE" "SERVER_IP=$SERVER_IP"
 render "$SCRIPT_DIR/systemd/recovery-dhcp-sniffer.service" /etc/systemd/system/recovery-dhcp-sniffer.service 0644 \
     "INSTALL_PREFIX=$INSTALL_PREFIX" "INTERFACE=$INTERFACE"
 install -m 0644 "$SCRIPT_DIR/systemd/clonezilla-http.service" /etc/systemd/system/clonezilla-http.service
