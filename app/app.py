@@ -11,7 +11,7 @@ from typing import Literal, Optional
 import yaml
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).parent
 HOSTS_FILE = APP_DIR / "hosts.yml"
@@ -20,6 +20,16 @@ DHCP_NAMES_FILE = APP_DIR / "dhcp_names.json"
 IPXE_DIR = Path("/srv/tftp")
 ALLOWLIST_HELPER = "/usr/local/bin/recovery-allowlist"
 BACKUP_STORAGE = "/srv/clonezilla-images"
+
+_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
+
+
+def _safe_name(candidate) -> str:
+    """Return the input if it matches our hostname regex, else empty string."""
+    if not candidate:
+        return ""
+    candidate = str(candidate).strip()
+    return candidate if _SAFE_NAME_RE.match(candidate) else ""
 
 
 def last_backup_at(mac: Optional[str]) -> Optional[float]:
@@ -772,7 +782,7 @@ async def delete_image(name: str):
 
 
 class NameUpdate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
 
 
 @app.put("/api/host/{ip}/name")
@@ -789,7 +799,7 @@ async def update_name(ip: str, payload: NameUpdate):
 class HostEntry(BaseModel):
     host: str
     mac: str
-    name: Optional[str] = None
+    name: Optional[str] = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
 
 
 class HostBatchAdd(BaseModel):
@@ -826,7 +836,7 @@ async def add_hosts(payload: HostBatchAdd):
         if entry.host in known_ips or mac_n in known_macs:
             skipped.append({"host": entry.host, "mac": mac_n, "reason": "already in list"})
             continue
-        name = (entry.name or "").strip() or suggested_name(mac_n, dhcp_names)
+        name = _safe_name((entry.name or "").strip() or suggested_name(mac_n, dhcp_names)) or "Unknown"
         new = {"name": name, "host": entry.host, "mac": mac_n}
         hosts.append(new)
         added.append(new)
@@ -1205,7 +1215,7 @@ async def api_scan():
             old_mac_n = None
         if old_mac_n == new_mac:
             continue
-        new_name = dhcp_names.get(new_mac) or f"Unknown-{new_mac.replace(':', '')[-4:]}"
+        new_name = _safe_name(dhcp_names.get(new_mac)) or f"Unknown-{new_mac.replace(':', '')[-4:]}"
         replaced.append({
             "host": ip,
             "old_mac": old_mac_n or old_mac_raw,
@@ -1249,7 +1259,7 @@ async def api_scan():
             mac_n = normalize_mac(mac)
         except ValueError:
             continue
-        real = dhcp_names.get(mac_n) or wsd_by_mac.get(mac_n)
+        real = _safe_name(dhcp_names.get(mac_n) or wsd_by_mac.get(mac_n))
         if real and real != h["name"]:
             renamed.append({"host": h["host"], "from": h["name"], "to": real})
             h["name"] = real
@@ -1259,7 +1269,7 @@ async def api_scan():
         if ip in skip_ips or ip in known_ips or mac in known_macs:
             continue
         discovered.append({
-            "name": suggested_name(mac, dhcp_names, wsd_names, ip),
+            "name": _safe_name(suggested_name(mac, dhcp_names, wsd_names, ip)) or "Unknown",
             "host": ip,
             "mac": mac,
             "category": classify_mac(mac),
@@ -1613,6 +1623,16 @@ function fmtBytes(n) {
   return (n/1024**3).toFixed(1) + ' GB';
 }
 
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 async function openRestorePicker(host, btn) {
   const modal = document.getElementById('restoreModal');
   const list = document.getElementById('restoreList');
@@ -1638,8 +1658,8 @@ async function openRestorePicker(host, btn) {
       const isOwn = isMatching(img);
       const date = new Date(img.mtime * 1000).toLocaleString();
       const hostLine = img.host_name
-        ? `<div class="name">${img.host_name} <span class="meta">(${img.host_ip})</span></div>`
-        : `<div class="name">${img.name}</div>`;
+        ? `<div class="name">${escapeHtml(img.host_name)} <span class="meta">(${escapeHtml(img.host_ip)})</span></div>`
+        : `<div class="name">${escapeHtml(img.name)}</div>`;
       const metaBits = [date, fmtBytes(img.size_bytes)];
       if (img.mac) metaBits.push(img.mac);
       if (img.host_name) metaBits.push(img.name);
@@ -1778,7 +1798,7 @@ async function refresh() {
         const backupCell = h.last_backup_at
           ? `<span class="latency" title="${new Date(h.last_backup_at * 1000).toLocaleString()}">${fmtRelative(serverNow - h.last_backup_at)}</span>`
           : '<span class="muted">never</span>';
-        const safeName = h.name.replace(/"/g, '&quot;');
+        const safeName = escapeHtml(h.name);
         const catBadge = h.category === 'pc' ? '<span class="cat-badge pc" title="MAC vendor is a known PC NIC">PC</span>'
                        : h.category === 'nonpc' ? '<span class="cat-badge nonpc" title="MAC vendor is a known non-PC device">non-PC</span>'
                        : '';
@@ -1908,7 +1928,7 @@ async function openAddDevicesPicker(btn) {
       const badge = dev.category === 'pc' ? '<span class="cat-badge pc">PC</span>'
                   : dev.category === 'nonpc' ? '<span class="cat-badge nonpc">non-PC</span>'
                   : '<span class="cat-badge unknown">?</span>';
-      const safeName = (dev.name || '').replace(/"/g, '&quot;');
+      const safeName = escapeHtml(dev.name || '');
       return `
         <li class="addDevices-row" data-i="${i}">
           <input type="checkbox" data-i="${i}">
@@ -1917,7 +1937,7 @@ async function openAddDevicesPicker(btn) {
               <input type="text" data-i="${i}" data-field="name" value="${safeName}">
               ${badge}
             </div>
-            <div class="meta">${dev.host} · ${dev.mac}${dev.vendor ? ' · ' + dev.vendor : ''}</div>
+            <div class="meta">${escapeHtml(dev.host)} · ${escapeHtml(dev.mac)}${dev.vendor ? ' · ' + escapeHtml(dev.vendor) : ''}</div>
           </div>
         </li>`;
     }).join('');
@@ -2020,7 +2040,7 @@ async function refreshBackups() {
     }
     rows.innerHTML = d.images.map(img => {
       const hostCell = img.host_name
-        ? `${img.host_name} <span class="muted">(${img.host_ip})</span>`
+        ? `${escapeHtml(img.host_name)} <span class="muted">(${escapeHtml(img.host_ip)})</span>`
         : '<span class="muted">unmatched</span>';
       const date = new Date(img.mtime * 1000).toLocaleString();
       let sizeCell;
@@ -2043,11 +2063,11 @@ async function refreshBackups() {
       return `
         <tr>
           <td>${hostCell}</td>
-          <td><span class="mac">${img.name}</span></td>
+          <td><span class="mac">${escapeHtml(img.name)}</span></td>
           <td>${date}</td>
           <td>${sizeCell}</td>
           <td>
-            <select class="action" data-name="${img.name}">
+            <select class="action" data-name="${escapeHtml(img.name)}">
               <option value="">Action…</option>
               <option value="delete">Delete</option>
             </select>
