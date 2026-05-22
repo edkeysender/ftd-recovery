@@ -1671,8 +1671,19 @@ async function openRestorePicker(host, btn) {
   const close = () => modal.classList.remove('show');
   cancel.onclick = close;
   confirm.onclick = () => {
+    if (!selected) return;
+    const hostLabel = host.name || host.host;
+    if (!window.confirm(
+      'Arm RESTORE for ' + hostLabel + '\n\n' +
+      'Image: ' + selected + '\n\n' +
+      'On its next PXE boot, this host will OVERWRITE ITS DISK with the\n' +
+      'selected image. This is irreversible.\n\n' +
+      'Continue?'
+    )) {
+      return;
+    }
     close();
-    if (selected) arm(host.host, 'recovery', btn, selected);
+    arm(host.host, 'recovery', btn, selected);
   };
 }
 
