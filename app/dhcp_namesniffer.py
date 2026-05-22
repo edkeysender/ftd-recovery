@@ -91,6 +91,10 @@ def parse_nbns(payload: bytes):
     if suffix != 0x00 or not _VALID_HOSTNAME_RE.match(name):
         return None
     return name, opcode
+
+
+def parse_dhcp(payload: bytes):
+    """Parse DHCP payload, return (mac, hostname, ip) or None."""
     if len(payload) < 240 or payload[2] != 6:
         return None
     if payload[236:240] != DHCP_MAGIC:
