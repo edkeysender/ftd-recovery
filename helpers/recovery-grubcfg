@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Write/remove a per-MAC GRUB config file for the recovery interface.
+# Filename: ${DIR}/grub.cfg-<mac-with-colons> (matches ${net_default_mac}).
+
+set -euo pipefail
+
+DIR=/srv/tftp/debian-installer/amd64/grub
+
+if [[ $# -lt 2 ]]; then
+  echo "usage: $(basename "$0") {write <mac> <mode> [image]|remove <mac>}" >&2
+  exit 2
+fi
+
+action=$1
+mac_in=$2
+
+if [[ ! "$mac_in" =~ ^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$ ]]; then
+  echo "invalid MAC: $mac_in" >&2
+  exit 1
+fi
+mac=$(echo "$mac_in" | tr "[:upper:]" "[:lower:]")
+target="${DIR}/grub.cfg-${mac}"
+
+case "$action" in
+  write)
+    if [[ $# -lt 3 ]]; then
+      echo "write requires <mac> <mode> [image]" >&2; exit 2
+    fi
+    mode=$3
+    image=${4:-}
+    case "$mode" in
+      backup)   script=ocs-backup.sh;  label="BACKUP (auto-armed)" ;;
+      recovery) script=ocs-restore.sh; label="RESTORE (auto-armed)" ;;
+      *) echo "unknown mode: $mode" >&2; exit 1 ;;
+    esac
+    # Validate image name (alnum + . _ -)
+    if [[ -n "$image" && ! "$image" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "invalid image name: $image" >&2; exit 1
+    fi
+    image_arg=""
+    [[ -n "$image" ]] && image_arg="ocs_image=${image} "
+
+    tmp=$(mktemp "${target}.XXXXXX")
+    chmod 644 "$tmp"
+    cat > "$tmp" <<EOF
+set timeout=0
+set default=0
+set gfxmode=auto
+insmod all_video
+insmod gfxterm
+terminal_output gfxterm
+
+menuentry "$label" {
+    linux (tftp)/clonezilla/vmlinuz boot=live locales=en_US.UTF-8 keyboard-layouts=us union=overlay username=user config components noswap edd=on nomodeset enforcing=0 noeject fetch=http://__SERVER_IP__:8080/clonezilla/filesystem.squashfs ${image_arg}ocs_prerun1="mount -t nfs __SERVER_IP__:/srv/clonezilla-images /home/partimag" ocs_prerun2="wget -q http://__SERVER_IP__:8080/${script} -O /tmp/r.sh" ocs_prerun3="chmod +x /tmp/r.sh" ocs_live_run="/tmp/r.sh" ocs_live_batch=no
+    initrd (tftp)/clonezilla/initrd.img
+}
+EOF
+    mv "$tmp" "$target"
+    ;;
+  remove)
+    rm -f "$target"
+    ;;
+  *)
+    echo "unknown action: $action" >&2; exit 2 ;;
+esac

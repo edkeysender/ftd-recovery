@@ -1,0 +1,25 @@
+[Unit]
+Description=FTD Recovery DHCP/NetBIOS hostname sniffer
+After=network-online.target dnsmasq.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=DHCP_SNIFF_IFACE=__INTERFACE__
+ExecStart=/usr/bin/python3 __INSTALL_PREFIX__/dhcp_namesniffer.py
+Restart=on-failure
+RestartSec=5
+User=root
+CapabilityBoundingSet=CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+AmbientCapabilities=CAP_NET_RAW CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__INSTALL_PREFIX__
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

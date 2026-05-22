@@ -1,0 +1,1 @@
+ftd ALL=(root) NOPASSWD: /usr/local/bin/recovery-grubcfg

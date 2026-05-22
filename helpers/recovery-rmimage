@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Remove a single Clonezilla image directory under /srv/clonezilla-images/.
+# Called by the recovery-interface to allow image cleanup from the UI.
+
+set -euo pipefail
+
+BASE=/srv/clonezilla-images
+
+if [[ $# -ne 1 ]]; then
+  echo "usage: $(basename "$0") <image-name>" >&2
+  exit 2
+fi
+
+name=$1
+
+# Reject empty, traversal, hidden, or anything outside [A-Za-z0-9._-]
+if [[ -z "$name" || "$name" =~ [^A-Za-z0-9._-] || "$name" == "." || "$name" == ".." ]]; then
+  echo "invalid image name: $name" >&2
+  exit 1
+fi
+
+target="${BASE}/${name}"
+
+# Must be an existing directory directly inside BASE
+if [[ ! -d "$target" ]]; then
+  echo "not a directory: $target" >&2
+  exit 1
+fi
+
+# Resolve and verify it is really inside BASE (defense in depth)
+resolved=$(readlink -f "$target")
+case "$resolved" in
+  "$BASE"/*) : ;;
+  *) echo "refusing to delete outside $BASE: $resolved" >&2; exit 1 ;;
+esac
+
+rm -rf -- "$resolved"
+echo "removed: $resolved"

@@ -1,0 +1,2 @@
+ftd ALL=(root) NOPASSWD: /usr/local/bin/recovery-allowlist
+ftd ALL=(root) NOPASSWD: /usr/sbin/arp-scan

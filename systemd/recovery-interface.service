@@ -1,0 +1,16 @@
+[Unit]
+Description=FTD Recovery web interface (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+Group=__SERVICE_USER__
+WorkingDirectory=__INSTALL_PREFIX__
+ExecStart=__INSTALL_PREFIX__/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8088
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

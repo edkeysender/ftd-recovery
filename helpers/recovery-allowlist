@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Add or remove a MAC address from the Clonezilla PXE allowlist.
+# Reloads dnsmasq so the change takes effect immediately.
+# Invoked by the recovery-interface service via sudo (NOPASSWD).
+
+set -euo pipefail
+
+FILE=/etc/clonezilla-server/dhcp-hosts.conf
+TAG=allowed
+
+if [[ $# -ne 2 ]]; then
+  echo "usage: $(basename "$0") {add|remove} <mac>" >&2
+  exit 2
+fi
+
+action=$1
+mac_in=$2
+
+# Strict MAC validation: exactly aa:bb:cc:dd:ee:ff (lower or upper hex).
+if [[ ! "$mac_in" =~ ^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$ ]]; then
+  echo "invalid MAC: $mac_in" >&2
+  exit 1
+fi
+
+mac=$(echo "$mac_in" | tr '[:upper:]' '[:lower:]')
+touch "$FILE"
+
+# Atomic edit: build a new file without any existing entry for this MAC,
+# then optionally append a fresh entry.
+tmp=$(mktemp "${FILE}.XXXXXX")
+chmod 644 "$tmp"
+grep -viE "^${mac}," "$FILE" > "$tmp" || true
+
+case "$action" in
+  add)
+    echo "${mac},set:${TAG}" >> "$tmp"
+    ;;
+  remove)
+    : # entry already filtered out
+    ;;
+  *)
+    rm -f "$tmp"
+    echo "unknown action: $action" >&2
+    exit 2
+    ;;
+esac
+
+mv "$tmp" "$FILE"
+
+# Tell dnsmasq to re-read the hostsfile.
+systemctl reload dnsmasq.service
