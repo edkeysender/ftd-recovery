@@ -114,6 +114,9 @@ fi
 # ── Step 5: app layout ──────────────────────────────────────────────────────
 log "installing application to $INSTALL_PREFIX"
 mkdir -p "$INSTALL_PREFIX"
+# Hand the prefix to the service user up-front so `sudo -u $SERVICE_USER python3 -m venv …`
+# (and pip install) can write inside it.
+chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_PREFIX"
 install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SCRIPT_DIR/app/app.py"               "$INSTALL_PREFIX/app.py"
 install -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SCRIPT_DIR/app/dhcp_namesniffer.py"  "$INSTALL_PREFIX/dhcp_namesniffer.py"
 install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SCRIPT_DIR/app/requirements.txt"     "$INSTALL_PREFIX/requirements.txt"
