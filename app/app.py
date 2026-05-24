@@ -1737,7 +1737,7 @@ async function disarm(ip, btn) {
   finally { btn.textContent = orig; btn.disabled = false; }
 }
 
-function buildActionsCell(h) {
+function buildActionsCell(h, storageOk) {
   // Only block actions while the job is actively running. Terminal states
   // (completed/failed) show a small badge alongside the normal buttons so the
   // user can immediately re-trigger or remove the host.
@@ -1771,6 +1771,9 @@ function buildActionsCell(h) {
   }
   const macAttr = h.mac ? '' : 'disabled title="No MAC known"';
   const onAttr = h.online ? '' : 'disabled title="Host offline"';
+  const backupAttr = h.mac
+    ? (storageOk ? '' : 'disabled title="Backup storage offline — fix the storage banner first"')
+    : 'disabled title="No MAC known"';
   let terminalBadge = '';
   if (terminal) {
     const phase = (p.phase || '').toLowerCase();
@@ -1789,7 +1792,7 @@ function buildActionsCell(h) {
       ${terminalBadge}
       <button class="wol"      data-ip="${h.host}" data-action="wol"      ${macAttr}>Wake</button>
       <button class="recovery" data-ip="${h.host}" data-action="recovery" ${macAttr}>Recovery</button>
-      <button class="backup"   data-ip="${h.host}" data-action="backup"   ${macAttr}>Backup</button>
+      <button class="backup"   data-ip="${h.host}" data-action="backup"   ${backupAttr}>Backup</button>
       <button class="shutdown" data-ip="${h.host}" data-action="shutdown" ${onAttr}>Shutdown</button>
       <button class="remove-btn" data-ip="${h.host}" data-action="remove" title="Remove from backup list">Remove</button>
     </div>`;
@@ -1808,6 +1811,7 @@ async function refresh() {
     if (!d.hosts.length) {
       rows.innerHTML = '<tr><td colspan="7" class="muted">No devices in the backup list yet. Click "Add backup devices" to scan and pick.</td></tr>';
     } else {
+      const storageOk = !!(d.storage && d.storage.ok);
       rows.innerHTML = d.hosts.map(h => {
         const macCell = h.mac
           ? `<span class="mac">${h.mac}</span>${h.mac_source === 'arp' ? ' <span class="muted">(arp)</span>' : ''}`
@@ -1828,7 +1832,7 @@ async function refresh() {
             <td>${macCell}</td>
             <td class="latency">${latencyCell}</td>
             <td>${backupCell}</td>
-            <td>${buildActionsCell(h)}</td>
+            <td>${buildActionsCell(h, storageOk)}</td>
           </tr>`;
       }).join('');
 
