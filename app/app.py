@@ -74,13 +74,11 @@ IPXE_LOCAL = "#!ipxe\necho No recovery mode armed for ${mac}. Booting local disk
 GRUBCFG_HELPER = "/usr/local/bin/recovery-grubcfg"
 
 def write_grub_armed(mac: str, mode: str, image: Optional[str] = None) -> None:
+    """Write the per-MAC grub.cfg. Raises CalledProcessError on failure — callers handle rollback."""
     cmd = ["sudo", "-n", GRUBCFG_HELPER, "write", mac, mode]
     if image:
         cmd.append(image)
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=10)
-    except subprocess.CalledProcessError as e:
-        print(f"[arm] grubcfg write failed for {mac}: {e.stderr.strip() or e}")
+    subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=10)
 
 def remove_grub_armed(mac: str) -> None:
     try:
@@ -930,24 +928,43 @@ async def arm_host(ip: str, payload: ArmRequest):
 
     state = load_state()
     state, _ = prune_expired(state)
+    save_state(state)  # persist any pruning side-effects
 
-    # If a different IP previously claimed this MAC, replace it.
     expires_at = time.time() + ARM_TTL
+
+    # 1. Write per-MAC grub.cfg first (idempotent — overwrites if exists)
+    try:
+        write_grub_armed(mac, payload.mode, payload.image)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"grub config write failed: {e.stderr.strip() or e}")
+
+    # 2. Add to dnsmasq allowlist
+    try:
+        run_allowlist("add", mac)
+    except subprocess.CalledProcessError as e:
+        # Roll back step 1.
+        remove_grub_armed(mac)
+        raise HTTPException(status_code=500, detail=f"allowlist add failed: {e.stderr.strip() or e}")
+
+    # 3. Persist state last
     state["armed"][mac] = {
         "mode": payload.mode,
         "armed_at": time.time(),
         "expires_at": expires_at,
         "host_ip": ip,
     }
-    save_state(state)
     try:
-        run_allowlist("add", mac)
-    except subprocess.CalledProcessError as e:
-        # Roll back state on allowlist failure.
-        del state["armed"][mac]
         save_state(state)
-        raise HTTPException(status_code=500, detail=f"allowlist add failed: {e.stderr.strip() or e}")
-    write_grub_armed(mac, payload.mode, payload.image)
+    except Exception as e:
+        # State save failure: roll back the real-world side effects so we don't
+        # leave the host armed-without-record.
+        try:
+            run_allowlist("remove", mac)
+        except Exception:
+            pass
+        remove_grub_armed(mac)
+        raise HTTPException(status_code=500, detail=f"state save failed: {e}")
+
     print(f"[arm] {ip} ({mac}) -> {payload.mode} (image={payload.image or 'own'}), expires {expires_at}")
     return {"ok": True, "mac": mac, "mode": payload.mode, "image": payload.image, "expires_at": expires_at}
 
