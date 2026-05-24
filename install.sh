@@ -126,6 +126,13 @@ ok "interface=$INTERFACE  server-ip=$SERVER_IP  subnet=$SUBNET_CIDR"
 # ── Step 3: storage (disc mapping) ──────────────────────────────────────────
 choose_storage
 
+# NFS exports use root_squash (UID 0 → nobody on the server) so a rogue LAN
+# client can't tamper with backups as root. Clonezilla still needs to write
+# image files via NFS, so make the bind-mount target world-writable with the
+# sticky bit (same model as /tmp — anyone can write, but can only delete
+# their own files).
+chmod 1777 /srv/clonezilla-images
+
 # ── Step 4: service user ────────────────────────────────────────────────────
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     log "creating service user: $SERVICE_USER"

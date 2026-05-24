@@ -1936,7 +1936,7 @@ async function openAddDevicesPicker(btn) {
     discovered.sort((a, b) => rank(a.category) - rank(b.category) || ipKey(a.host).localeCompare(ipKey(b.host)));
     warnings = { replaced: d.replaced || [], removed: d.removed || [] };
   } catch (e) {
-    list.innerHTML = `<li class="muted">Scan failed: ${e.message}</li>`;
+    list.innerHTML = `<li class="muted">Scan failed: ${escapeHtml(e.message)}</li>`;
     sub.textContent = '';
     btn.disabled = false;
     return;
