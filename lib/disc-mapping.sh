@@ -129,21 +129,25 @@ _mode2_adopt_partition() {
 # _mode3_format_disk — wipe + format a whole disk, mount, bind.
 _mode3_format_disk() {
     local -a d_names=() d_sizes=() d_models=() d_serials=()
-    local name size type model serial short risky
+    local name short risky
 
-    while IFS=$'\t' read -r name size type model serial; do
-        [[ "$type" != "disk" ]] && continue
+    # Query names only first (avoids IFS/space issues with multi-word model strings).
+    while read -r name; do
+        [[ -z "$name" ]] && continue
         short=${name##*/}
         [[ "$short" =~ ^(loop|zram|ram|sr) ]] && continue
+        [[ "$(lsblk -dno TYPE "$name" 2>/dev/null)" != "disk" ]] && continue
         _is_system_disk "$short" && continue
         risky=""
         while read -r _child cmp; do
             case "$cmp" in /|/boot|/boot/*|/usr|/usr/*|/var|/var/*) risky=1 ;; esac
-        done < <(lsblk -rnpo NAME,MOUNTPOINT "$name" | tail -n +2)
+        done < <(lsblk -lpno NAME,MOUNTPOINT "$name" | tail -n +1 | grep -v "^$name ")
         [[ -n "$risky" ]] && continue
-        d_names+=("$name"); d_sizes+=("$size")
-        d_models+=("${model:-?}"); d_serials+=("${serial:-?}")
-    done < <(lsblk -drnpo NAME,SIZE,TYPE,MODEL,SERIAL)
+        d_names+=("$name")
+        d_sizes+=("$(lsblk -dno SIZE "$name")")
+        d_models+=("$(lsblk -dno MODEL "$name" | xargs || echo '?')")
+        d_serials+=("$(lsblk -dno SERIAL "$name" | xargs || echo '?')")
+    done < <(lsblk -dpno NAME)
 
     [[ ${#d_names[@]} -eq 0 ]] && die "no eligible whole disks found (system disk and mounted disks excluded)"
 
