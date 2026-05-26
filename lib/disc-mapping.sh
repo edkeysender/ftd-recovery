@@ -126,46 +126,46 @@ _mode2_adopt_partition() {
     ok "$dev mounted at $mountpoint"
 }
 
-# _list_candidate_disks — whole disks that are NOT the system disk and have no mounted children.
-_list_candidate_disks() {
-    local name size model serial type
-    while IFS=$'\t' read -r name size type model serial; do
-        [[ "$type" != "disk" ]] && continue
-        [[ "$name" =~ ^(loop|zram|ram|sr) ]] && continue
-        local short
-        short=${name##*/}
-        _is_system_disk "$short" && continue
-        # Skip if any child of this disk is currently mounted to / /boot /usr /var
-        local risky=""
-        while read -r child cmp; do
-            case "$cmp" in
-                /|/boot|/boot/*|/usr|/usr/*|/var|/var/*) risky=1 ;;
-            esac
-        done < <(lsblk -rnpo NAME,MOUNTPOINT "$name" | tail -n +2)
-        [[ -n "$risky" ]] && continue
-        printf '  %s\t%s\t%s\t%s\n' "$name" "$size" "${model:-?}" "${serial:-?}"
-    done < <(lsblk -drnpo NAME,SIZE,TYPE,MODEL,SERIAL)
-}
-
 # _mode3_format_disk — wipe + format a whole disk, mount, bind.
 _mode3_format_disk() {
-    echo
-    echo "${BOLD}Eligible whole disks (system disk and mounted disks excluded):${RESET}"
-    printf '  %s\t%s\t%s\t%s\n' DEVICE SIZE MODEL SERIAL
-    _list_candidate_disks
-    echo
-    local dev
+    local -a d_names=() d_sizes=() d_models=() d_serials=()
+    local name size type model serial short risky
+
+    while IFS=$'\t' read -r name size type model serial; do
+        [[ "$type" != "disk" ]] && continue
+        short=${name##*/}
+        [[ "$short" =~ ^(loop|zram|ram|sr) ]] && continue
+        _is_system_disk "$short" && continue
+        risky=""
+        while read -r _child cmp; do
+            case "$cmp" in /|/boot|/boot/*|/usr|/usr/*|/var|/var/*) risky=1 ;; esac
+        done < <(lsblk -rnpo NAME,MOUNTPOINT "$name" | tail -n +2)
+        [[ -n "$risky" ]] && continue
+        d_names+=("$name"); d_sizes+=("$size")
+        d_models+=("${model:-?}"); d_serials+=("${serial:-?}")
+    done < <(lsblk -drnpo NAME,SIZE,TYPE,MODEL,SERIAL)
+
+    [[ ${#d_names[@]} -eq 0 ]] && die "no eligible whole disks found (system disk and mounted disks excluded)"
+
+    {
+        echo
+        echo "${BOLD}Eligible whole disks (system disk and mounted disks excluded):${RESET}"
+        local i
+        for i in "${!d_names[@]}"; do
+            printf '  %s%d)%s %-15s  %-8s  %-28s  %s\n' \
+                "$BOLD" "$((i+1))" "$RESET" \
+                "${d_names[$i]}" "${d_sizes[$i]}" "${d_models[$i]}" "${d_serials[$i]}"
+        done
+        echo
+    } >&2
+
+    local reply dev
     while true; do
-        dev=$(ask "Whole disk to format (e.g. /dev/nvme1n1)" "")
-        [[ -b "$dev" ]] || { warn "$dev is not a block device"; continue; }
-        if _is_system_disk "$(basename "$dev")"; then
-            die "REFUSING: $dev is the system disk"
+        read -r -p "${BOLD}Disk to format${RESET} [1-${#d_names[@]}]: " reply </dev/tty
+        if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#d_names[@]} )); then
+            dev="${d_names[$((reply-1))]}"; break
         fi
-        # Make sure none of its children are mounted as system FS
-        if lsblk -rnpo MOUNTPOINT "$dev" | grep -E '^(/$|/boot|/usr|/var)' >/dev/null; then
-            die "REFUSING: $dev has a child mounted as a system filesystem"
-        fi
-        break
+        warn "enter a number between 1 and ${#d_names[@]}"
     done
     local size model serial
     size=$(lsblk -dno SIZE "$dev")

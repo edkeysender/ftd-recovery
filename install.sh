@@ -66,14 +66,15 @@ echo
 # ── Step 1: dependencies ────────────────────────────────────────────────────
 log "installing system packages"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq \
+( apt-get update -qq && apt-get install -y -qq \
     python3 python3-venv python3-pip \
     dnsmasq tftpd-hpa arp-scan nfs-kernel-server \
     parted e2fsprogs \
     curl wget ca-certificates \
     isc-dhcp-common \
-    >/dev/null
+    >/dev/null ) &
+_spin $!
+wait $!
 # tftpd-hpa is installed for the tftp-hpa user/group; we still let dnsmasq serve TFTP.
 systemctl disable --now tftpd-hpa 2>/dev/null || true
 ok "system packages installed"

@@ -17,6 +17,19 @@ warn()  { printf '%swarn%s %s\n'   "$YELLOW" "$RESET" "$*" >&2; }
 err()   { printf '%serror%s %s\n'  "$RED"    "$RESET" "$*" >&2; }
 die()   { err "$*"; exit 1; }
 
+# _spin <pid> — show an animated spinner on its own line while <pid> is alive.
+# Erases itself when the process exits. No-ops when stdout is not a terminal.
+_spin() {
+    local pid=$1 i=0 frames='|/-\'
+    [[ -t 1 ]] || return 0
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r    %s' "${DIM}${frames:$((i % 4)):1}${RESET}"
+        sleep 0.12
+        (( i++ )) || true
+    done
+    printf '\r       \r'
+}
+
 require_root() {
     [[ $EUID -eq 0 ]] || die "this script must run as root (try: sudo $0)"
 }
