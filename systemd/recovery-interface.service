@@ -7,8 +7,9 @@ Wants=network-online.target
 Type=simple
 User=__SERVICE_USER__
 Group=__SERVICE_USER__
+Environment=RECOVERY_IFACE=__INTERFACE__
 WorkingDirectory=__INSTALL_PREFIX__
-ExecStart=__INSTALL_PREFIX__/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8088
+ExecStart=__INSTALL_PREFIX__/venv/bin/uvicorn app:app --host __SERVER_IP__ --port 8088
 Restart=on-failure
 RestartSec=3
 

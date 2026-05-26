@@ -66,14 +66,15 @@ echo
 # ── Step 1: dependencies ────────────────────────────────────────────────────
 log "installing system packages"
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq \
+( apt-get update -qq && apt-get install -y -qq \
     python3 python3-venv python3-pip \
     dnsmasq tftpd-hpa arp-scan nfs-kernel-server \
     parted e2fsprogs \
     curl wget ca-certificates \
     isc-dhcp-common \
-    >/dev/null
+    >/dev/null ) &
+_spin $!
+wait $!
 # tftpd-hpa is installed for the tftp-hpa user/group; we still let dnsmasq serve TFTP.
 systemctl disable --now tftpd-hpa 2>/dev/null || true
 ok "system packages installed"
@@ -83,6 +84,18 @@ if [[ -z "$INTERFACE" ]]; then
     INTERFACE=$(detect_default_iface || true)
 fi
 INTERFACE=$(ask_interface "Network interface for PXE/dnsmasq" "${INTERFACE:-eth0}")
+
+# Warn when the chosen interface is also the default-route (internet-facing) NIC.
+# Proxy-DHCP on a shared network can interfere with other DHCP servers.
+DEFAULT_ROUTE_IFACE=$(detect_default_iface || true)
+if [[ -n "$DEFAULT_ROUTE_IFACE" && "$DEFAULT_ROUTE_IFACE" == "$INTERFACE" ]]; then
+    warn "$INTERFACE is also your internet connection."
+    warn "This is fine on a small local network (a switch + recovery devices)."
+    warn "On a large shared network it may disrupt other devices."
+    if ! confirm "Is this Pi on a small local network? Continue?" "y"; then
+        die "Aborted. Re-run and select a dedicated network interface."
+    fi
+fi
 
 # Auto-detect IP and subnet from the chosen interface; CLI/env values win.
 DETECTED_IP=$(detect_iface_ip "$INTERFACE" || true)
@@ -109,6 +122,13 @@ ok "interface=$INTERFACE  server-ip=$SERVER_IP  subnet=$SUBNET_CIDR"
 
 # ── Step 3: storage (disc mapping) ──────────────────────────────────────────
 choose_storage
+
+# NFS exports use root_squash (UID 0 → nobody on the server) so a rogue LAN
+# client can't tamper with backups as root. Clonezilla still needs to write
+# image files via NFS, so make the bind-mount target world-writable with the
+# sticky bit (same model as /tmp — anyone can write, but can only delete
+# their own files).
+chmod 1777 /srv/clonezilla-images
 
 # ── Step 4: service user ────────────────────────────────────────────────────
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
@@ -158,12 +178,16 @@ install -m 0644 "$SCRIPT_DIR/tftp/debian-installer/amd64/grub/grub.cfg" \
 if [[ ! -s /srv/tftp/grubnetx64.efi ]]; then
     log "downloading Debian netboot tarball for grubnetx64.efi"
     tmp=$(mktemp -d)
-    curl -fsSL "$DEBIAN_NETBOOT_URL" -o "$tmp/netboot.tar.gz"
+    curl -fL --progress-bar "$DEBIAN_NETBOOT_URL" -o "$tmp/netboot.tar.gz"
     tar -xzf "$tmp/netboot.tar.gz" -C "$tmp"
-    # tarball layout: debian-installer/amd64/{grub/, ...} and top-level symlinks
-    install -m 0644 "$tmp/debian-installer/amd64/grub/grubx64.efi" /srv/tftp/grubnetx64.efi
-    cp -r "$tmp/debian-installer/amd64/grub/x86_64-efi" /srv/tftp/debian-installer/amd64/grub/
-    install -m 0644 "$tmp/debian-installer/amd64/grub/unicode.pf2" /srv/tftp/debian-installer/amd64/grub/unicode.pf2
+    # Locate grub EFI — filename and path vary across Debian releases.
+    grub_efi=$(find "$tmp" \( -name "grubx64.efi" -o -name "grubnetx64.efi" -o -name "grubnetx64.efi.signed" \) \
+               ! -name "*.sig" | head -1)
+    [[ -z "$grub_efi" ]] && die "could not find grub EFI in Debian netboot tarball — check DEBIAN_NETBOOT_URL"
+    grub_dir=$(dirname "$grub_efi")
+    install -m 0644 "$grub_efi" /srv/tftp/grubnetx64.efi
+    [[ -d "$grub_dir/x86_64-efi" ]] && cp -r "$grub_dir/x86_64-efi" /srv/tftp/debian-installer/amd64/grub/
+    [[ -f "$grub_dir/unicode.pf2" ]] && install -m 0644 "$grub_dir/unicode.pf2" /srv/tftp/debian-installer/amd64/grub/unicode.pf2
     rm -rf "$tmp"
 fi
 # NICs configured for iPXE filename will request ipxe.0 — point it at GRUB.
@@ -174,9 +198,9 @@ ok "TFTP boot files in place"
 if [[ ! -s /srv/tftp/clonezilla/vmlinuz \
    || ! -s /srv/tftp/clonezilla/initrd.img \
    || ! -s /srv/tftp/clonezilla/filesystem.squashfs ]]; then
-    log "downloading Clonezilla live ${CLONEZILLA_VERSION}"
+    log "downloading Clonezilla live ${CLONEZILLA_VERSION} (~700 MB)"
     tmp=$(mktemp -d)
-    curl -fL "$CLONEZILLA_ISO_URL" -o "$tmp/cz.iso"
+    curl -fL --progress-bar "$CLONEZILLA_ISO_URL" -o "$tmp/cz.iso"
     mkdir -p "$tmp/iso"
     mount -o loop,ro "$tmp/cz.iso" "$tmp/iso"
     install -m 0644 "$tmp/iso/live/vmlinuz"            /srv/tftp/clonezilla/vmlinuz
@@ -194,6 +218,7 @@ log "installing helper scripts and sudoers fragments"
 render "$SCRIPT_DIR/helpers/recovery-grubcfg" /usr/local/bin/recovery-grubcfg 0755 "SERVER_IP=$SERVER_IP"
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-allowlist" /usr/local/bin/recovery-allowlist
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-rmimage"   /usr/local/bin/recovery-rmimage
+install -m 0755 "$SCRIPT_DIR/helpers/recovery-remount"   /usr/local/bin/recovery-remount
 
 for f in ftd-grubcfg ftd-rmimage recovery-interface; do
     # Rewrite the leading user token to whatever SERVICE_USER is.
@@ -233,7 +258,8 @@ ok "NFS export active"
 # ── Step 10: systemd units ──────────────────────────────────────────────────
 log "installing systemd units"
 render "$SCRIPT_DIR/systemd/recovery-interface.service" /etc/systemd/system/recovery-interface.service 0644 \
-    "INSTALL_PREFIX=$INSTALL_PREFIX" "SERVICE_USER=$SERVICE_USER"
+    "INSTALL_PREFIX=$INSTALL_PREFIX" "SERVICE_USER=$SERVICE_USER" \
+    "INTERFACE=$INTERFACE" "SERVER_IP=$SERVER_IP"
 render "$SCRIPT_DIR/systemd/recovery-dhcp-sniffer.service" /etc/systemd/system/recovery-dhcp-sniffer.service 0644 \
     "INSTALL_PREFIX=$INSTALL_PREFIX" "INTERFACE=$INTERFACE"
 install -m 0644 "$SCRIPT_DIR/systemd/clonezilla-http.service" /etc/systemd/system/clonezilla-http.service
@@ -244,17 +270,29 @@ ok "services enabled and started"
 
 # ── Step 11: summary ────────────────────────────────────────────────────────
 echo
-echo "${BOLD}${GREEN}Install complete.${RESET}"
+echo "${BOLD}${GREEN}Installation complete!${RESET}"
 echo
-echo "  ${BOLD}UI:${RESET}            http://$SERVER_IP:8088/"
-echo "  ${BOLD}install dir:${RESET}   $INSTALL_PREFIX"
-echo "  ${BOLD}backup storage:${RESET} $STORAGE_UNDERLYING/clonezilla-images  →  /srv/clonezilla-images"
-echo "  ${BOLD}interface:${RESET}     $INTERFACE  (subnet $SUBNET_CIDR)"
+echo "  Open this address in your browser to get started:"
 echo
-echo "Verify with:"
+echo "  ${BOLD}${CYAN}http://$SERVER_IP:8088/${RESET}"
+echo
+
+# Static IP guidance — detect which network manager is in use.
+IP_NOTE=""
+if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    IP_NOTE="To set a static IP: run ${BOLD}nmtui${RESET}, choose Edit Connection → ${INTERFACE} → IPv4 → Manual."
+elif [[ -f /etc/dhcpcd.conf ]]; then
+    IP_NOTE="To set a static IP, add these lines to ${BOLD}/etc/dhcpcd.conf${RESET} and reboot:
+  interface $INTERFACE
+  static ip_address=$SERVER_IP/$(echo "$SUBNET_CIDR" | cut -d/ -f2)
+  static routers=<your-router-ip>"
+else
+    IP_NOTE="To set a static IP, configure ${BOLD}$INTERFACE${RESET} in your network manager or /etc/network/interfaces and reboot."
+fi
+
+echo "${YELLOW}Note:${RESET} the IP address above must not change after installation."
+echo "$IP_NOTE"
+echo
+echo "${DIM}Troubleshooting:"
 echo "  systemctl status recovery-interface clonezilla-http recovery-dhcp-sniffer dnsmasq nfs-server"
-echo "  curl http://$SERVER_IP:8088/api/status"
-echo
-echo "Static IP: this installer did NOT change network config. If $INTERFACE"
-echo "is on DHCP, configure a reservation on your DHCP server, or set a static"
-echo "IP in /etc/network/interfaces (Debian) or via NetworkManager (RPi OS)."
+echo "  curl http://$SERVER_IP:8088/api/status${RESET}"

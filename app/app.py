@@ -11,7 +11,7 @@ from typing import Literal, Optional
 import yaml
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, PlainTextResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).parent
 HOSTS_FILE = APP_DIR / "hosts.yml"
@@ -20,6 +20,17 @@ DHCP_NAMES_FILE = APP_DIR / "dhcp_names.json"
 IPXE_DIR = Path("/srv/tftp")
 ALLOWLIST_HELPER = "/usr/local/bin/recovery-allowlist"
 BACKUP_STORAGE = "/srv/clonezilla-images"
+
+_SAFE_NAME_PAT = r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$"
+_SAFE_NAME_RE = re.compile(_SAFE_NAME_PAT)
+
+
+def _safe_name(candidate) -> str:
+    """Return the input if it matches our hostname regex, else empty string."""
+    if not candidate:
+        return ""
+    candidate = str(candidate).strip()
+    return candidate if _SAFE_NAME_RE.match(candidate) else ""
 
 
 def last_backup_at(mac: Optional[str]) -> Optional[float]:
@@ -50,6 +61,7 @@ PING_TIMEOUT = 1
 HOSTNAME_TTL = 300
 ARM_TTL = 300  # 5 minutes
 PROGRESS_TTL = 120  # progress entries older than this are stale and hidden
+INTERFACE = os.environ.get("RECOVERY_IFACE", "eth0")
 
 Mode = Literal["recovery", "backup"]
 MODE_TO_IPXE_FILE = {
@@ -62,13 +74,11 @@ IPXE_LOCAL = "#!ipxe\necho No recovery mode armed for ${mac}. Booting local disk
 GRUBCFG_HELPER = "/usr/local/bin/recovery-grubcfg"
 
 def write_grub_armed(mac: str, mode: str, image: Optional[str] = None) -> None:
+    """Write the per-MAC grub.cfg. Raises CalledProcessError on failure — callers handle rollback."""
     cmd = ["sudo", "-n", GRUBCFG_HELPER, "write", mac, mode]
     if image:
         cmd.append(image)
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=10)
-    except subprocess.CalledProcessError as e:
-        print(f"[arm] grubcfg write failed for {mac}: {e.stderr.strip() or e}")
+    subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=10)
 
 def remove_grub_armed(mac: str) -> None:
     try:
@@ -568,10 +578,17 @@ def send_wol_packet(mac: str) -> None:
 # ---------- Storage health ----------
 
 def check_storage() -> dict:
-    """Verify the backup destination is mounted and writable."""
+    """Verify the backup destination is mounted and writable; auto-remount if disconnected."""
+    if not os.path.ismount(BACKUP_STORAGE):
+        # Drive may have been reconnected — mount underlying device then bind.
+        try:
+            subprocess.run(["sudo", "/usr/local/bin/recovery-remount"],
+                           capture_output=True, timeout=15, check=True)
+        except Exception:
+            pass
     if not os.path.ismount(BACKUP_STORAGE):
         return {"ok": False, "path": BACKUP_STORAGE,
-                "error": "not mounted (check /mnt/backup and fstab)"}
+                "error": "backup drive not connected — reconnect it and wait a moment"}
     try:
         st = os.statvfs(BACKUP_STORAGE)
     except OSError as e:
@@ -771,7 +788,7 @@ async def delete_image(name: str):
 
 
 class NameUpdate(BaseModel):
-    name: str
+    name: str = Field(min_length=1, max_length=64, pattern=_SAFE_NAME_PAT)
 
 
 @app.put("/api/host/{ip}/name")
@@ -788,7 +805,7 @@ async def update_name(ip: str, payload: NameUpdate):
 class HostEntry(BaseModel):
     host: str
     mac: str
-    name: Optional[str] = None
+    name: Optional[str] = Field(default=None, max_length=64, pattern=_SAFE_NAME_PAT)
 
 
 class HostBatchAdd(BaseModel):
@@ -825,7 +842,7 @@ async def add_hosts(payload: HostBatchAdd):
         if entry.host in known_ips or mac_n in known_macs:
             skipped.append({"host": entry.host, "mac": mac_n, "reason": "already in list"})
             continue
-        name = (entry.name or "").strip() or suggested_name(mac_n, dhcp_names)
+        name = _safe_name((entry.name or "").strip() or suggested_name(mac_n, dhcp_names)) or "Unknown"
         new = {"name": name, "host": entry.host, "mac": mac_n}
         hosts.append(new)
         added.append(new)
@@ -918,24 +935,43 @@ async def arm_host(ip: str, payload: ArmRequest):
 
     state = load_state()
     state, _ = prune_expired(state)
+    save_state(state)  # persist any pruning side-effects
 
-    # If a different IP previously claimed this MAC, replace it.
     expires_at = time.time() + ARM_TTL
+
+    # 1. Write per-MAC grub.cfg first (idempotent — overwrites if exists)
+    try:
+        write_grub_armed(mac, payload.mode, payload.image)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"grub config write failed: {e.stderr.strip() or e}")
+
+    # 2. Add to dnsmasq allowlist
+    try:
+        run_allowlist("add", mac)
+    except subprocess.CalledProcessError as e:
+        # Roll back step 1.
+        remove_grub_armed(mac)
+        raise HTTPException(status_code=500, detail=f"allowlist add failed: {e.stderr.strip() or e}")
+
+    # 3. Persist state last
     state["armed"][mac] = {
         "mode": payload.mode,
         "armed_at": time.time(),
         "expires_at": expires_at,
         "host_ip": ip,
     }
-    save_state(state)
     try:
-        run_allowlist("add", mac)
-    except subprocess.CalledProcessError as e:
-        # Roll back state on allowlist failure.
-        del state["armed"][mac]
         save_state(state)
-        raise HTTPException(status_code=500, detail=f"allowlist add failed: {e.stderr.strip() or e}")
-    write_grub_armed(mac, payload.mode, payload.image)
+    except Exception as e:
+        # State save failure: roll back the real-world side effects so we don't
+        # leave the host armed-without-record.
+        try:
+            run_allowlist("remove", mac)
+        except Exception:
+            pass
+        remove_grub_armed(mac)
+        raise HTTPException(status_code=500, detail=f"state save failed: {e}")
+
     print(f"[arm] {ip} ({mac}) -> {payload.mode} (image={payload.image or 'own'}), expires {expires_at}")
     return {"ok": True, "mac": mac, "mode": payload.mode, "image": payload.image, "expires_at": expires_at}
 
@@ -1140,10 +1176,10 @@ async def wsd_discover_names(source_ip: str) -> dict[str, str]:
 
 
 async def arp_scan_subnet() -> list[tuple[str, str]]:
-    """Return [(ip, mac), ...] for live hosts on eth0's local subnet."""
+    """Return [(ip, mac), ...] for live hosts on the configured interface's local subnet."""
     proc = await asyncio.create_subprocess_exec(
         "sudo", "-n", "/usr/sbin/arp-scan",
-        "--interface=eth0", "--localnet", "--quiet", "--plain",
+        f"--interface={INTERFACE}", "--localnet", "--quiet", "--plain",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -1204,7 +1240,7 @@ async def api_scan():
             old_mac_n = None
         if old_mac_n == new_mac:
             continue
-        new_name = dhcp_names.get(new_mac) or f"Unknown-{new_mac.replace(':', '')[-4:]}"
+        new_name = _safe_name(dhcp_names.get(new_mac)) or f"Unknown-{new_mac.replace(':', '')[-4:]}"
         replaced.append({
             "host": ip,
             "old_mac": old_mac_n or old_mac_raw,
@@ -1248,7 +1284,7 @@ async def api_scan():
             mac_n = normalize_mac(mac)
         except ValueError:
             continue
-        real = dhcp_names.get(mac_n) or wsd_by_mac.get(mac_n)
+        real = _safe_name(dhcp_names.get(mac_n) or wsd_by_mac.get(mac_n))
         if real and real != h["name"]:
             renamed.append({"host": h["host"], "from": h["name"], "to": real})
             h["name"] = real
@@ -1258,7 +1294,7 @@ async def api_scan():
         if ip in skip_ips or ip in known_ips or mac in known_macs:
             continue
         discovered.append({
-            "name": suggested_name(mac, dhcp_names, wsd_names, ip),
+            "name": _safe_name(suggested_name(mac, dhcp_names, wsd_names, ip)) or "Unknown",
             "host": ip,
             "mac": mac,
             "category": classify_mac(mac),
@@ -1612,6 +1648,16 @@ function fmtBytes(n) {
   return (n/1024**3).toFixed(1) + ' GB';
 }
 
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 async function openRestorePicker(host, btn) {
   const modal = document.getElementById('restoreModal');
   const list = document.getElementById('restoreList');
@@ -1637,8 +1683,8 @@ async function openRestorePicker(host, btn) {
       const isOwn = isMatching(img);
       const date = new Date(img.mtime * 1000).toLocaleString();
       const hostLine = img.host_name
-        ? `<div class="name">${img.host_name} <span class="meta">(${img.host_ip})</span></div>`
-        : `<div class="name">${img.name}</div>`;
+        ? `<div class="name">${escapeHtml(img.host_name)} <span class="meta">(${escapeHtml(img.host_ip)})</span></div>`
+        : `<div class="name">${escapeHtml(img.name)}</div>`;
       const metaBits = [date, fmtBytes(img.size_bytes)];
       if (img.mac) metaBits.push(img.mac);
       if (img.host_name) metaBits.push(img.name);
@@ -1670,8 +1716,19 @@ async function openRestorePicker(host, btn) {
   const close = () => modal.classList.remove('show');
   cancel.onclick = close;
   confirm.onclick = () => {
+    if (!selected) return;
+    const hostLabel = host.name || host.host;
+    if (!window.confirm(
+      'Arm RESTORE for ' + hostLabel + '\\n\\n' +
+      'Image: ' + selected + '\\n\\n' +
+      'On its next PXE boot, this host will OVERWRITE ITS DISK with the\\n' +
+      'selected image. This is irreversible.\\n\\n' +
+      'Continue?'
+    )) {
+      return;
+    }
     close();
-    if (selected) arm(host.host, 'recovery', btn, selected);
+    arm(host.host, 'recovery', btn, selected);
   };
 }
 
@@ -1687,7 +1744,7 @@ async function disarm(ip, btn) {
   finally { btn.textContent = orig; btn.disabled = false; }
 }
 
-function buildActionsCell(h) {
+function buildActionsCell(h, storageOk) {
   // Only block actions while the job is actively running. Terminal states
   // (completed/failed) show a small badge alongside the normal buttons so the
   // user can immediately re-trigger or remove the host.
@@ -1721,6 +1778,9 @@ function buildActionsCell(h) {
   }
   const macAttr = h.mac ? '' : 'disabled title="No MAC known"';
   const onAttr = h.online ? '' : 'disabled title="Host offline"';
+  const backupAttr = h.mac
+    ? (storageOk ? '' : 'disabled title="Backup storage offline — fix the storage banner first"')
+    : 'disabled title="No MAC known"';
   let terminalBadge = '';
   if (terminal) {
     const phase = (p.phase || '').toLowerCase();
@@ -1739,7 +1799,7 @@ function buildActionsCell(h) {
       ${terminalBadge}
       <button class="wol"      data-ip="${h.host}" data-action="wol"      ${macAttr}>Wake</button>
       <button class="recovery" data-ip="${h.host}" data-action="recovery" ${macAttr}>Recovery</button>
-      <button class="backup"   data-ip="${h.host}" data-action="backup"   ${macAttr}>Backup</button>
+      <button class="backup"   data-ip="${h.host}" data-action="backup"   ${backupAttr}>Backup</button>
       <button class="shutdown" data-ip="${h.host}" data-action="shutdown" ${onAttr}>Shutdown</button>
       <button class="remove-btn" data-ip="${h.host}" data-action="remove" title="Remove from backup list">Remove</button>
     </div>`;
@@ -1758,6 +1818,7 @@ async function refresh() {
     if (!d.hosts.length) {
       rows.innerHTML = '<tr><td colspan="7" class="muted">No devices in the backup list yet. Click "Add backup devices" to scan and pick.</td></tr>';
     } else {
+      const storageOk = !!(d.storage && d.storage.ok);
       rows.innerHTML = d.hosts.map(h => {
         const macCell = h.mac
           ? `<span class="mac">${h.mac}</span>${h.mac_source === 'arp' ? ' <span class="muted">(arp)</span>' : ''}`
@@ -1766,7 +1827,7 @@ async function refresh() {
         const backupCell = h.last_backup_at
           ? `<span class="latency" title="${new Date(h.last_backup_at * 1000).toLocaleString()}">${fmtRelative(serverNow - h.last_backup_at)}</span>`
           : '<span class="muted">never</span>';
-        const safeName = h.name.replace(/"/g, '&quot;');
+        const safeName = escapeHtml(h.name);
         const catBadge = h.category === 'pc' ? '<span class="cat-badge pc" title="MAC vendor is a known PC NIC">PC</span>'
                        : h.category === 'nonpc' ? '<span class="cat-badge nonpc" title="MAC vendor is a known non-PC device">non-PC</span>'
                        : '';
@@ -1778,7 +1839,7 @@ async function refresh() {
             <td>${macCell}</td>
             <td class="latency">${latencyCell}</td>
             <td>${backupCell}</td>
-            <td>${buildActionsCell(h)}</td>
+            <td>${buildActionsCell(h, storageOk)}</td>
           </tr>`;
       }).join('');
 
@@ -1811,7 +1872,7 @@ async function refresh() {
     const s = d.storage || {};
     if (!s.ok) {
       banner.className = 'banner err';
-      banner.textContent = `⚠ Backup storage offline: ${s.path || ''} — ${s.error || 'unknown error'}. Backups will fail until this is fixed.`;
+      banner.textContent = `⚠ Backup drive offline — ${s.error || 'unknown error'}. Backups are paused.`;
     } else {
       banner.className = 'banner ok-info';
       banner.textContent = `Backup storage: ${s.path} · ${s.free_gb} GB free of ${s.total_gb} GB`;
@@ -1882,7 +1943,7 @@ async function openAddDevicesPicker(btn) {
     discovered.sort((a, b) => rank(a.category) - rank(b.category) || ipKey(a.host).localeCompare(ipKey(b.host)));
     warnings = { replaced: d.replaced || [], removed: d.removed || [] };
   } catch (e) {
-    list.innerHTML = `<li class="muted">Scan failed: ${e.message}</li>`;
+    list.innerHTML = `<li class="muted">Scan failed: ${escapeHtml(e.message)}</li>`;
     sub.textContent = '';
     btn.disabled = false;
     return;
@@ -1896,7 +1957,7 @@ async function openAddDevicesPicker(btn) {
       const badge = dev.category === 'pc' ? '<span class="cat-badge pc">PC</span>'
                   : dev.category === 'nonpc' ? '<span class="cat-badge nonpc">non-PC</span>'
                   : '<span class="cat-badge unknown">?</span>';
-      const safeName = (dev.name || '').replace(/"/g, '&quot;');
+      const safeName = escapeHtml(dev.name || '');
       return `
         <li class="addDevices-row" data-i="${i}">
           <input type="checkbox" data-i="${i}">
@@ -1905,7 +1966,7 @@ async function openAddDevicesPicker(btn) {
               <input type="text" data-i="${i}" data-field="name" value="${safeName}">
               ${badge}
             </div>
-            <div class="meta">${dev.host} · ${dev.mac}${dev.vendor ? ' · ' + dev.vendor : ''}</div>
+            <div class="meta">${escapeHtml(dev.host)} · ${escapeHtml(dev.mac)}${dev.vendor ? ' · ' + escapeHtml(dev.vendor) : ''}</div>
           </div>
         </li>`;
     }).join('');
@@ -1948,14 +2009,14 @@ async function openAddDevicesPicker(btn) {
     if (warnings.replaced.length) {
       parts.push('<strong>⚠ MAC address changed at these IPs — hardware was swapped:</strong>');
       parts.push(warnings.replaced.map(r =>
-        `&nbsp;&nbsp;${r.host}: ${r.old_mac} → ${r.new_mac} (was &quot;${r.old_name}&quot;, now &quot;${r.new_name}&quot;)`
+        `&nbsp;&nbsp;${escapeHtml(r.host)}: ${escapeHtml(r.old_mac)} → ${escapeHtml(r.new_mac)} (was "${escapeHtml(r.old_name)}", now "${escapeHtml(r.new_name)}")`
       ).join('<br>'));
     }
     if (warnings.removed.length) {
       if (parts.length) parts.push('<br>');
       parts.push('<strong>Removed duplicate entries (same MAC as another host):</strong>');
       parts.push(warnings.removed.map(r =>
-        `&nbsp;&nbsp;${r.host} (&quot;${r.name}&quot;) — ${r.reason}; kept ${r.kept_host}`
+        `&nbsp;&nbsp;${escapeHtml(r.host)} ("${escapeHtml(r.name)}") — ${escapeHtml(r.reason)}; kept ${escapeHtml(r.kept_host)}`
       ).join('<br>'));
     }
     parts.push(' <button class="banner-dismiss" type="button">dismiss</button>');
@@ -2008,7 +2069,7 @@ async function refreshBackups() {
     }
     rows.innerHTML = d.images.map(img => {
       const hostCell = img.host_name
-        ? `${img.host_name} <span class="muted">(${img.host_ip})</span>`
+        ? `${escapeHtml(img.host_name)} <span class="muted">(${escapeHtml(img.host_ip)})</span>`
         : '<span class="muted">unmatched</span>';
       const date = new Date(img.mtime * 1000).toLocaleString();
       let sizeCell;
@@ -2031,11 +2092,11 @@ async function refreshBackups() {
       return `
         <tr>
           <td>${hostCell}</td>
-          <td><span class="mac">${img.name}</span></td>
+          <td><span class="mac">${escapeHtml(img.name)}</span></td>
           <td>${date}</td>
           <td>${sizeCell}</td>
           <td>
-            <select class="action" data-name="${img.name}">
+            <select class="action" data-name="${escapeHtml(img.name)}">
               <option value="">Action…</option>
               <option value="delete">Delete</option>
             </select>

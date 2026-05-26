@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Remount backup storage after drive reconnect.
+# Reads /etc/fstab to find the underlying mount, mounts it first,
+# then mounts the bind to /srv/clonezilla-images.
+set -euo pipefail
+
+BIND="/srv/clonezilla-images"
+
+# Find the bind source directory from fstab (e.g. /mnt/ftd-backup/clonezilla-images).
+bind_src=$(awk -v dst="$BIND" '$2 == dst && $1 !~ /^#/ {print $1; exit}' /etc/fstab)
+if [[ -z "$bind_src" ]]; then
+    echo "recovery-remount: no fstab entry found for $BIND" >&2
+    exit 1
+fi
+
+# The underlying mount point is the parent directory of the bind source.
+underlying=$(dirname "$bind_src")
+
+if ! mountpoint -q "$underlying" 2>/dev/null; then
+    mount "$underlying" || { echo "recovery-remount: failed to mount $underlying" >&2; exit 1; }
+fi
+
+if ! mountpoint -q "$BIND" 2>/dev/null; then
+    mount "$BIND" || { echo "recovery-remount: failed to mount $BIND" >&2; exit 1; }
+fi
