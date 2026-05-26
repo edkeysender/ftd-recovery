@@ -182,7 +182,7 @@ install -m 0644 "$SCRIPT_DIR/tftp/debian-installer/amd64/grub/grub.cfg" \
 if [[ ! -s /srv/tftp/grubnetx64.efi ]]; then
     log "downloading Debian netboot tarball for grubnetx64.efi"
     tmp=$(mktemp -d)
-    curl -fsSL "$DEBIAN_NETBOOT_URL" -o "$tmp/netboot.tar.gz"
+    curl -fL --progress-bar "$DEBIAN_NETBOOT_URL" -o "$tmp/netboot.tar.gz"
     tar -xzf "$tmp/netboot.tar.gz" -C "$tmp"
     # tarball layout: debian-installer/amd64/{grub/, ...} and top-level symlinks
     install -m 0644 "$tmp/debian-installer/amd64/grub/grubx64.efi" /srv/tftp/grubnetx64.efi
@@ -198,9 +198,9 @@ ok "TFTP boot files in place"
 if [[ ! -s /srv/tftp/clonezilla/vmlinuz \
    || ! -s /srv/tftp/clonezilla/initrd.img \
    || ! -s /srv/tftp/clonezilla/filesystem.squashfs ]]; then
-    log "downloading Clonezilla live ${CLONEZILLA_VERSION}"
+    log "downloading Clonezilla live ${CLONEZILLA_VERSION} (~700 MB)"
     tmp=$(mktemp -d)
-    curl -fL "$CLONEZILLA_ISO_URL" -o "$tmp/cz.iso"
+    curl -fL --progress-bar "$CLONEZILLA_ISO_URL" -o "$tmp/cz.iso"
     mkdir -p "$tmp/iso"
     mount -o loop,ro "$tmp/cz.iso" "$tmp/iso"
     install -m 0644 "$tmp/iso/live/vmlinuz"            /srv/tftp/clonezilla/vmlinuz
@@ -269,17 +269,29 @@ ok "services enabled and started"
 
 # ── Step 11: summary ────────────────────────────────────────────────────────
 echo
-echo "${BOLD}${GREEN}Install complete.${RESET}"
+echo "${BOLD}${GREEN}Installation complete!${RESET}"
 echo
-echo "  ${BOLD}UI:${RESET}            http://$SERVER_IP:8088/"
-echo "  ${BOLD}install dir:${RESET}   $INSTALL_PREFIX"
-echo "  ${BOLD}backup storage:${RESET} $STORAGE_UNDERLYING/clonezilla-images  →  /srv/clonezilla-images"
-echo "  ${BOLD}interface:${RESET}     $INTERFACE  (subnet $SUBNET_CIDR)"
+echo "  Open this address in your browser to get started:"
 echo
-echo "Verify with:"
+echo "  ${BOLD}${CYAN}http://$SERVER_IP:8088/${RESET}"
+echo
+
+# Static IP guidance — detect which network manager is in use.
+IP_NOTE=""
+if systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    IP_NOTE="To set a static IP: run ${BOLD}nmtui${RESET}, choose Edit Connection → ${INTERFACE} → IPv4 → Manual."
+elif [[ -f /etc/dhcpcd.conf ]]; then
+    IP_NOTE="To set a static IP, add these lines to ${BOLD}/etc/dhcpcd.conf${RESET} and reboot:
+  interface $INTERFACE
+  static ip_address=$SERVER_IP/$(echo "$SUBNET_CIDR" | cut -d/ -f2)
+  static routers=<your-router-ip>"
+else
+    IP_NOTE="To set a static IP, configure ${BOLD}$INTERFACE${RESET} in your network manager or /etc/network/interfaces and reboot."
+fi
+
+echo "${YELLOW}Note:${RESET} the IP address above must not change after installation."
+echo "$IP_NOTE"
+echo
+echo "${DIM}Troubleshooting:"
 echo "  systemctl status recovery-interface clonezilla-http recovery-dhcp-sniffer dnsmasq nfs-server"
-echo "  curl http://$SERVER_IP:8088/api/status"
-echo
-echo "Static IP: this installer did NOT change network config. If $INTERFACE"
-echo "is on DHCP, configure a reservation on your DHCP server, or set a static"
-echo "IP in /etc/network/interfaces (Debian) or via NetworkManager (RPi OS)."
+echo "  curl http://$SERVER_IP:8088/api/status${RESET}"

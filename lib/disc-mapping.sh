@@ -55,68 +55,83 @@ _mode1_existing_mount() {
         break
     done
     STORAGE_UNDERLYING="$path"
-    ok "using existing mount: $path"
+    ok "using existing path: $path"
 }
 
-# _list_candidate_partitions — prints partitions that are NOT on the system disk
-# and NOT currently mounted to a system directory.
-_list_candidate_partitions() {
-    local line name size fstype mountpoint pkname
-    while IFS=$'\t' read -r name size fstype mountpoint pkname; do
-        [[ "$fstype" == "swap" ]] && continue
-        # skip system disk's children
-        if _is_system_disk "$pkname"; then continue; fi
-        # skip already mounted to /, /boot*, /usr, /var, /srv/clonezilla-images
-        case "$mountpoint" in
-            /|/boot|/boot/*|/usr|/usr/*|/var|/var/*) continue ;;
-        esac
-        printf '  %s\t%s\t%s\t%s\n' "$name" "$size" "${fstype:-(none)}" "${mountpoint:-(unmounted)}"
-    done < <(lsblk -rnpo NAME,SIZE,FSTYPE,MOUNTPOINT,PKNAME | awk '$1 ~ /[0-9]$/')
-}
-
-# _mode2_adopt_partition — pick an existing partition, mount by UUID, set up bind.
+# _mode2_adopt_partition [device] — pick a formatted partition, mount by UUID, set up bind.
+# If device is given (from auto-detect) the selection step is skipped.
 _mode2_adopt_partition() {
-    echo
-    echo "${BOLD}Eligible partitions (system disk excluded):${RESET}"
-    printf '  %s\t%s\t%s\t%s\n' DEVICE SIZE FSTYPE MOUNTPOINT
-    _list_candidate_partitions
-    echo
-    local dev
-    while true; do
-        dev=$(ask "Partition device (e.g. /dev/nvme1n1p1)" "")
-        [[ -b "$dev" ]] || { warn "$dev is not a block device"; continue; }
-        if _is_system_disk "$(lsblk -no PKNAME "$dev")"; then
-            warn "refusing: $dev belongs to the system disk"; continue
-        fi
-        break
-    done
+    local preselected=${1:-} dev
+
+    if [[ -n "$preselected" ]]; then
+        dev="$preselected"
+    else
+        local -a p_names=() p_sizes=() p_fstypes=() p_mounts=()
+        local name pkname short fstype mp
+
+        while read -r name; do
+            [[ -z "$name" ]] && continue
+            pkname=$(lsblk -no PKNAME "$name" 2>/dev/null | xargs || true)
+            short=${pkname##*/}
+            _is_system_disk "$short" && continue
+            fstype=$(lsblk -no FSTYPE "$name" 2>/dev/null | xargs || true)
+            [[ "$fstype" == "swap" ]] && continue
+            mp=$(lsblk -no MOUNTPOINT "$name" 2>/dev/null | xargs || true)
+            case "$mp" in /|/boot|/boot/*|/usr|/usr/*|/var|/var/*) continue ;; esac
+            p_names+=("$name")
+            p_sizes+=("$(lsblk -no SIZE "$name" | xargs)")
+            p_fstypes+=("${fstype:-(none)}")
+            p_mounts+=("${mp:-(not mounted)}")
+        done < <(lsblk -lpno NAME | awk '$1 ~ /[0-9]$/')
+
+        [[ ${#p_names[@]} -eq 0 ]] && die "no eligible partitions found (system disk excluded)"
+
+        {
+            echo
+            echo "${BOLD}Available partitions:${RESET}"
+            local i
+            for i in "${!p_names[@]}"; do
+                printf '  %s%d)%s %-15s  %-8s  %-10s  %s\n' \
+                    "$BOLD" "$((i+1))" "$RESET" \
+                    "${p_names[$i]}" "${p_sizes[$i]}" "${p_fstypes[$i]}" "${p_mounts[$i]}"
+            done
+            echo
+        } >&2
+
+        local reply
+        while true; do
+            read -r -p "${BOLD}Partition to use${RESET} [1-${#p_names[@]}]: " reply </dev/tty
+            if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#p_names[@]} )); then
+                dev="${p_names[$((reply-1))]}"; break
+            fi
+            warn "enter a number between 1 and ${#p_names[@]}"
+        done
+    fi
+
     local uuid fstype
     uuid=$(blkid -s UUID -o value "$dev" 2>/dev/null || true)
     fstype=$(blkid -s TYPE -o value "$dev" 2>/dev/null || true)
-    [[ -z "$uuid" ]] && die "$dev has no filesystem UUID — format it first (try mode 3)"
+    [[ -z "$uuid" ]] && die "$dev has no filesystem — use option 3 to erase and format it first"
     [[ -z "$fstype" ]] && die "$dev has no recognized filesystem"
-    log "found $dev: UUID=$uuid TYPE=$fstype"
+    log "found $dev: UUID=$uuid type=$fstype"
 
+    # Keep existing mountpoint if already mounted, otherwise use default.
     local mountpoint
-    mountpoint=$(ask "Where to mount $dev" "/mnt/ftd-backup")
-    mkdir -p "$mountpoint"
-
     local already_mounted
     already_mounted=$(findmnt -no TARGET --source "UUID=$uuid" 2>/dev/null || true)
-    if [[ -n "$already_mounted" && "$already_mounted" != "$mountpoint" ]]; then
-        if confirm "$dev is already mounted at $already_mounted. Unmount and remount at $mountpoint?" "n"; then
-            umount "$already_mounted" || die "could not umount $already_mounted"
-        else
-            mountpoint="$already_mounted"
-            log "keeping existing mountpoint: $mountpoint"
-        fi
+    if [[ -n "$already_mounted" ]]; then
+        mountpoint="$already_mounted"
+        log "already mounted at $mountpoint"
+    else
+        mountpoint="/mnt/ftd-backup"
+        mkdir -p "$mountpoint"
     fi
 
     if ! grep -qE "^UUID=$uuid[[:space:]]" /etc/fstab; then
         echo "UUID=$uuid  $mountpoint  $fstype  defaults,noatime,nofail  0  2" >> /etc/fstab
-        ok "added fstab entry for UUID=$uuid"
+        ok "drive registered in fstab"
     else
-        log "fstab entry for UUID=$uuid already present, leaving as-is"
+        log "drive already registered in fstab"
     fi
     systemctl daemon-reload || true
     if ! findmnt -no TARGET "$mountpoint" >/dev/null 2>&1; then
@@ -126,85 +141,89 @@ _mode2_adopt_partition() {
     ok "$dev mounted at $mountpoint"
 }
 
-# _mode3_format_disk — wipe + format a whole disk, mount, bind.
+# _mode3_format_disk [device] — wipe + format a whole disk, mount, bind.
+# If device is given (from auto-detect) the selection step is skipped.
 _mode3_format_disk() {
-    local -a d_names=() d_sizes=() d_models=() d_serials=()
-    local name short risky
+    local preselected=${1:-} dev
 
-    # Query names only first (avoids IFS/space issues with multi-word model strings).
-    while read -r name; do
-        [[ -z "$name" ]] && continue
-        short=${name##*/}
-        [[ "$short" =~ ^(loop|zram|ram|sr) ]] && continue
-        [[ "$(lsblk -dno TYPE "$name" 2>/dev/null)" != "disk" ]] && continue
-        _is_system_disk "$short" && continue
-        risky=""
-        while read -r _child cmp; do
-            case "$cmp" in /|/boot|/boot/*|/usr|/usr/*|/var|/var/*) risky=1 ;; esac
-        done < <(lsblk -lpno NAME,MOUNTPOINT "$name" | tail -n +1 | grep -v "^$name ")
-        [[ -n "$risky" ]] && continue
-        d_names+=("$name")
-        d_sizes+=("$(lsblk -dno SIZE "$name")")
-        d_models+=("$(lsblk -dno MODEL "$name" | xargs || echo '?')")
-        d_serials+=("$(lsblk -dno SERIAL "$name" | xargs || echo '?')")
-    done < <(lsblk -dpno NAME)
+    if [[ -n "$preselected" ]]; then
+        dev="$preselected"
+    else
+        local -a d_names=() d_sizes=() d_models=() d_serials=()
+        local name short risky
 
-    [[ ${#d_names[@]} -eq 0 ]] && die "no eligible whole disks found (system disk and mounted disks excluded)"
+        while read -r name; do
+            [[ -z "$name" ]] && continue
+            short=${name##*/}
+            [[ "$short" =~ ^(loop|zram|ram|sr) ]] && continue
+            [[ "$(lsblk -dno TYPE "$name" 2>/dev/null)" != "disk" ]] && continue
+            _is_system_disk "$short" && continue
+            risky=""
+            while read -r _child cmp; do
+                case "$cmp" in /|/boot|/boot/*|/usr|/usr/*|/var|/var/*) risky=1 ;; esac
+            done < <(lsblk -lpno NAME,MOUNTPOINT "$name" | tail -n +1 | grep -v "^$name ")
+            [[ -n "$risky" ]] && continue
+            d_names+=("$name")
+            d_sizes+=("$(lsblk -dno SIZE "$name")")
+            d_models+=("$(lsblk -dno MODEL "$name" | xargs || echo '?')")
+            d_serials+=("$(lsblk -dno SERIAL "$name" | xargs || echo '?')")
+        done < <(lsblk -dpno NAME)
 
-    {
-        echo
-        echo "${BOLD}Eligible whole disks (system disk and mounted disks excluded):${RESET}"
-        local i
-        for i in "${!d_names[@]}"; do
-            printf '  %s%d)%s %-15s  %-8s  %-28s  %s\n' \
-                "$BOLD" "$((i+1))" "$RESET" \
-                "${d_names[$i]}" "${d_sizes[$i]}" "${d_models[$i]}" "${d_serials[$i]}"
+        [[ ${#d_names[@]} -eq 0 ]] && die "no eligible drives found (system disk and drives in use are excluded)"
+
+        {
+            echo
+            echo "${BOLD}Available drives:${RESET}"
+            local i
+            for i in "${!d_names[@]}"; do
+                printf '  %s%d)%s %-15s  %-8s  %-28s  %s\n' \
+                    "$BOLD" "$((i+1))" "$RESET" \
+                    "${d_names[$i]}" "${d_sizes[$i]}" "${d_models[$i]}" "${d_serials[$i]}"
+            done
+            echo
+        } >&2
+
+        local reply
+        while true; do
+            read -r -p "${BOLD}Drive to erase and use${RESET} [1-${#d_names[@]}]: " reply </dev/tty
+            if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#d_names[@]} )); then
+                dev="${d_names[$((reply-1))]}"; break
+            fi
+            warn "enter a number between 1 and ${#d_names[@]}"
         done
-        echo
-    } >&2
+    fi
 
-    local reply dev
-    while true; do
-        read -r -p "${BOLD}Disk to format${RESET} [1-${#d_names[@]}]: " reply </dev/tty
-        if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#d_names[@]} )); then
-            dev="${d_names[$((reply-1))]}"; break
-        fi
-        warn "enter a number between 1 and ${#d_names[@]}"
-    done
     local size model serial
     size=$(lsblk -dno SIZE "$dev")
     model=$(lsblk -dno MODEL "$dev" | xargs)
     serial=$(lsblk -dno SERIAL "$dev" | xargs)
 
     echo
-    echo "${RED}${BOLD}WARNING:${RESET} this will ${RED}DESTROY ALL DATA${RESET} on:"
-    echo "  device : $dev"
+    echo "${RED}${BOLD}WARNING: this will permanently erase all data on:${RESET}"
+    echo "  drive  : $model"
     echo "  size   : $size"
-    echo "  model  : $model"
-    echo "  serial : $serial"
+    echo "  device : $dev"
     echo
-    [[ -z "$serial" ]] && die "cannot identify disk serial — refusing to format without a stable identifier"
-    if ! ask_typed_match "Type the disk SERIAL to confirm" "$serial"; then
-        die "serial mismatch — aborted"
+    [[ -z "$serial" ]] && die "cannot identify drive — refusing to erase without a stable identifier"
+    if ! ask_typed_match "Type ERASE to confirm" "ERASE"; then
+        die "confirmation failed — drive was not erased"
     fi
 
-    log "creating GPT label and single ext4 partition on $dev"
+    log "partitioning and formatting $dev"
     parted -s "$dev" mklabel gpt
     parted -s -a optimal "$dev" mkpart primary ext4 0% 100%
-    # Re-read partition table; settle udev.
     partprobe "$dev"
     udevadm settle
 
-    # Find the new partition (handle both nvme1n1p1 and sda1 naming)
     local part
     part=$(lsblk -rnpo NAME "$dev" | awk -v d="$dev" '$1 != d {print; exit}')
     [[ -b "$part" ]] || die "could not locate new partition on $dev"
-    log "formatting $part as ext4 (label=ftd-backup)"
+    log "formatting $part as ext4"
     mkfs.ext4 -F -L ftd-backup "$part"
 
     local uuid
     uuid=$(blkid -s UUID -o value "$part")
-    [[ -n "$uuid" ]] || die "no UUID after mkfs"
+    [[ -n "$uuid" ]] || die "no UUID after formatting"
 
     local mountpoint="/mnt/ftd-backup"
     mkdir -p "$mountpoint"
@@ -214,7 +233,7 @@ _mode3_format_disk() {
     systemctl daemon-reload || true
     mount "$mountpoint" || die "mount $mountpoint failed"
     STORAGE_UNDERLYING="$mountpoint"
-    ok "formatted $part (UUID=$uuid), mounted at $mountpoint"
+    ok "drive formatted and mounted at $mountpoint"
 }
 
 # _setup_bind_mount — bind <STORAGE_UNDERLYING>/clonezilla-images → /srv/clonezilla-images
@@ -235,7 +254,6 @@ _setup_bind_mount() {
         mount "$STORAGE_BIND" || die "bind-mount $STORAGE_BIND failed"
     fi
 
-    # Final write test on the canonical app-facing path.
     touch "$STORAGE_BIND/.ftd-writetest" || die "$STORAGE_BIND is not writable"
     rm -f "$STORAGE_BIND/.ftd-writetest"
     ok "$STORAGE_BIND is mounted and writable"
@@ -243,10 +261,77 @@ _setup_bind_mount() {
 
 choose_storage() {
     _show_block_devices
+
+    # ── Auto-detect ─────────────────────────────────────────────────────────
+    # Collect candidate partitions (mode 2 eligible).
+    local -a cand_parts=()
+    local name pkname short fstype mp risky
+
+    while read -r name; do
+        [[ -z "$name" ]] && continue
+        pkname=$(lsblk -no PKNAME "$name" 2>/dev/null | xargs || true)
+        short=${pkname##*/}
+        _is_system_disk "$short" && continue
+        fstype=$(lsblk -no FSTYPE "$name" 2>/dev/null | xargs || true)
+        [[ "$fstype" == "swap" ]] && continue
+        mp=$(lsblk -no MOUNTPOINT "$name" 2>/dev/null | xargs || true)
+        case "$mp" in /|/boot|/boot/*|/usr|/usr/*|/var|/var/*) continue ;; esac
+        cand_parts+=("$name")
+    done < <(lsblk -lpno NAME | awk '$1 ~ /[0-9]$/')
+
+    # Collect candidate disks (mode 3 eligible).
+    local -a cand_disks=()
+    while read -r name; do
+        [[ -z "$name" ]] && continue
+        short=${name##*/}
+        [[ "$short" =~ ^(loop|zram|ram|sr) ]] && continue
+        [[ "$(lsblk -dno TYPE "$name" 2>/dev/null)" != "disk" ]] && continue
+        _is_system_disk "$short" && continue
+        risky=""
+        while read -r _c cmp; do
+            case "$cmp" in /|/boot|/boot/*|/usr|/usr/*|/var|/var/*) risky=1 ;; esac
+        done < <(lsblk -lpno NAME,MOUNTPOINT "$name" | grep -v "^$name ")
+        [[ -n "$risky" ]] && continue
+        cand_disks+=("$name")
+    done < <(lsblk -dpno NAME)
+
+    # Exactly one formatted partition → suggest adopting it.
+    if [[ ${#cand_parts[@]} -eq 1 ]]; then
+        local part="${cand_parts[0]}"
+        local fstype_p mp_p size_p model_p pkname_p
+        fstype_p=$(lsblk -no FSTYPE "$part" 2>/dev/null | xargs || true)
+        if [[ -n "$fstype_p" ]]; then
+            mp_p=$(lsblk -no MOUNTPOINT "$part" 2>/dev/null | xargs || true)
+            size_p=$(lsblk -no SIZE "$part" | xargs)
+            pkname_p=$(lsblk -no PKNAME "$part" 2>/dev/null | xargs || true)
+            model_p=$(lsblk -no MODEL "$pkname_p" 2>/dev/null | xargs || echo "external drive")
+            echo "${BOLD}Found one available drive:${RESET} ${model_p} — ${size_p}${mp_p:+ (already mounted at $mp_p)}"
+            if confirm "Use it for backup storage?" "y"; then
+                _mode2_adopt_partition "$part"
+                _setup_bind_mount; return
+            fi
+        fi
+    fi
+
+    # No formatted partitions but exactly one blank disk → suggest erasing it.
+    if [[ ${#cand_parts[@]} -eq 0 && ${#cand_disks[@]} -eq 1 ]]; then
+        local disk="${cand_disks[0]}"
+        local size_d model_d
+        size_d=$(lsblk -dno SIZE "$disk")
+        model_d=$(lsblk -dno MODEL "$disk" | xargs || echo "external drive")
+        echo "${BOLD}Found one available drive:${RESET} ${model_d} — ${size_d} (not yet formatted)"
+        warn "Setting it up will erase all data on the drive."
+        if confirm "Set it up as backup storage?" "n"; then
+            _mode3_format_disk "$disk"
+            _setup_bind_mount; return
+        fi
+    fi
+
+    # ── Manual selection ─────────────────────────────────────────────────────
     echo "${BOLD}How should backups be stored?${RESET}"
-    echo "  1) Use an existing directory or already-mounted path"
-    echo "  2) Adopt an existing partition (read UUID, add fstab, mount)"
-    echo "  3) Format a fresh whole disk (DESTRUCTIVE — confirms by serial)"
+    echo "  1) Use a folder on this Pi (no extra drive needed)"
+    echo "  2) Use an existing external drive (already formatted)"
+    echo "  3) Erase and set up a blank drive (removes all data on that drive)"
     echo
     local choice
     while true; do
@@ -255,7 +340,7 @@ choose_storage() {
             1) _mode1_existing_mount; break ;;
             2) _mode2_adopt_partition; break ;;
             3) _mode3_format_disk; break ;;
-            *) warn "invalid choice: $choice" ;;
+            *) warn "enter 1, 2, or 3" ;;
         esac
     done
     _setup_bind_mount
