@@ -85,19 +85,15 @@ if [[ -z "$INTERFACE" ]]; then
 fi
 INTERFACE=$(ask_interface "Network interface for PXE/dnsmasq" "${INTERFACE:-eth0}")
 
-# Refuse silently using the corporate uplink: if the chosen iface is the
-# default-route NIC, proxy-DHCP on it will answer PXE on whatever network
-# is upstream (typically the corporate LAN), which interferes with the
-# real DHCP server. Make the operator explicitly opt in.
+# Warn when the chosen interface is also the default-route (internet-facing) NIC.
+# Proxy-DHCP on a shared network can interfere with other DHCP servers.
 DEFAULT_ROUTE_IFACE=$(detect_default_iface || true)
 if [[ -n "$DEFAULT_ROUTE_IFACE" && "$DEFAULT_ROUTE_IFACE" == "$INTERFACE" ]]; then
-    warn "Interface '$INTERFACE' is the default-route NIC."
-    warn "Proxy-DHCP on this NIC will answer PXE on whatever network is"
-    warn "upstream (often the corporate LAN). This interferes with other"
-    warn "DHCP servers and is almost certainly not what you want unless"
-    warn "this Pi is on a dedicated, isolated PXE LAN."
-    if ! confirm "Continue with $INTERFACE despite the warning?" "n"; then
-        die "Aborting. Re-run install.sh and pick an isolated PXE interface."
+    warn "$INTERFACE is also your internet connection."
+    warn "This is fine on a small local network (a switch + recovery devices)."
+    warn "On a large shared network it may disrupt other devices."
+    if ! confirm "Is this Pi on a small local network? Continue?" "y"; then
+        die "Aborted. Re-run and select a dedicated network interface."
     fi
 fi
 
