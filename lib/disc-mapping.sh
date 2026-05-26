@@ -260,11 +260,24 @@ _setup_bind_mount() {
     mkdir -p "$src" "$STORAGE_BIND"
 
     local fstab_line="$src  $STORAGE_BIND  none  bind,nofail,x-systemd.requires-mounts-for=$STORAGE_UNDERLYING  0  0"
-    if ! grep -qE "^[^#]*[[:space:]]$STORAGE_BIND[[:space:]]" /etc/fstab; then
+
+    local current_src
+    current_src=$(awk -v dst="$STORAGE_BIND" '$2 == dst && $1 !~ /^#/ {print $1; exit}' /etc/fstab || true)
+
+    if [[ -z "$current_src" ]]; then
         echo "$fstab_line" >> /etc/fstab
         ok "added bind-mount fstab entry"
+    elif [[ "$current_src" != "$src" ]]; then
+        # Storage device changed — replace the old entry and remount.
+        sed -i "\|[[:space:]]${STORAGE_BIND}[[:space:]]|d" /etc/fstab
+        echo "$fstab_line" >> /etc/fstab
+        ok "updated bind-mount: $current_src → $src"
+        # Unmount the stale bind so we remount from the new source below.
+        if findmnt -no TARGET "$STORAGE_BIND" >/dev/null 2>&1; then
+            umount "$STORAGE_BIND" 2>/dev/null || true
+        fi
     else
-        log "bind-mount fstab entry already present"
+        log "bind-mount fstab entry already correct"
     fi
 
     systemctl daemon-reload || true
