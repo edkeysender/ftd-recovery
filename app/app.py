@@ -1712,10 +1712,10 @@ async function openRestorePicker(host, btn) {
     if (!selected) return;
     const hostLabel = host.name || host.host;
     if (!window.confirm(
-      'Arm RESTORE for ' + hostLabel + '\n\n' +
-      'Image: ' + selected + '\n\n' +
-      'On its next PXE boot, this host will OVERWRITE ITS DISK with the\n' +
-      'selected image. This is irreversible.\n\n' +
+      'Arm RESTORE for ' + hostLabel + '\\n\\n' +
+      'Image: ' + selected + '\\n\\n' +
+      'On its next PXE boot, this host will OVERWRITE ITS DISK with the\\n' +
+      'selected image. This is irreversible.\\n\\n' +
       'Continue?'
     )) {
       return;
