@@ -180,10 +180,14 @@ if [[ ! -s /srv/tftp/grubnetx64.efi ]]; then
     tmp=$(mktemp -d)
     curl -fL --progress-bar "$DEBIAN_NETBOOT_URL" -o "$tmp/netboot.tar.gz"
     tar -xzf "$tmp/netboot.tar.gz" -C "$tmp"
-    # tarball layout: debian-installer/amd64/{grub/, ...} and top-level symlinks
-    install -m 0644 "$tmp/debian-installer/amd64/grub/grubx64.efi" /srv/tftp/grubnetx64.efi
-    cp -r "$tmp/debian-installer/amd64/grub/x86_64-efi" /srv/tftp/debian-installer/amd64/grub/
-    install -m 0644 "$tmp/debian-installer/amd64/grub/unicode.pf2" /srv/tftp/debian-installer/amd64/grub/unicode.pf2
+    # Locate grub EFI — filename and path vary across Debian releases.
+    grub_efi=$(find "$tmp" \( -name "grubx64.efi" -o -name "grubnetx64.efi" -o -name "grubnetx64.efi.signed" \) \
+               ! -name "*.sig" | head -1)
+    [[ -z "$grub_efi" ]] && die "could not find grub EFI in Debian netboot tarball — check DEBIAN_NETBOOT_URL"
+    grub_dir=$(dirname "$grub_efi")
+    install -m 0644 "$grub_efi" /srv/tftp/grubnetx64.efi
+    [[ -d "$grub_dir/x86_64-efi" ]] && cp -r "$grub_dir/x86_64-efi" /srv/tftp/debian-installer/amd64/grub/
+    [[ -f "$grub_dir/unicode.pf2" ]] && install -m 0644 "$grub_dir/unicode.pf2" /srv/tftp/debian-installer/amd64/grub/unicode.pf2
     rm -rf "$tmp"
 fi
 # NICs configured for iPXE filename will request ipxe.0 — point it at GRUB.
