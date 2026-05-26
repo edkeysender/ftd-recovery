@@ -218,6 +218,7 @@ log "installing helper scripts and sudoers fragments"
 render "$SCRIPT_DIR/helpers/recovery-grubcfg" /usr/local/bin/recovery-grubcfg 0755 "SERVER_IP=$SERVER_IP"
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-allowlist" /usr/local/bin/recovery-allowlist
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-rmimage"   /usr/local/bin/recovery-rmimage
+install -m 0755 "$SCRIPT_DIR/helpers/recovery-remount"   /usr/local/bin/recovery-remount
 
 for f in ftd-grubcfg ftd-rmimage recovery-interface; do
     # Rewrite the leading user token to whatever SERVICE_USER is.

@@ -1,3 +1,3 @@
 ftd ALL=(root) NOPASSWD: /usr/local/bin/recovery-allowlist
 ftd ALL=(root) NOPASSWD: /usr/sbin/arp-scan
-ftd ALL=(root) NOPASSWD: /bin/mount /srv/clonezilla-images
+ftd ALL=(root) NOPASSWD: /usr/local/bin/recovery-remount

@@ -580,10 +580,10 @@ def send_wol_packet(mac: str) -> None:
 def check_storage() -> dict:
     """Verify the backup destination is mounted and writable; auto-remount if disconnected."""
     if not os.path.ismount(BACKUP_STORAGE):
-        # Drive may have been reconnected — try to remount via fstab entry.
+        # Drive may have been reconnected — mount underlying device then bind.
         try:
-            subprocess.run(["sudo", "/bin/mount", BACKUP_STORAGE],
-                           capture_output=True, timeout=10, check=True)
+            subprocess.run(["sudo", "/usr/local/bin/recovery-remount"],
+                           capture_output=True, timeout=15, check=True)
         except Exception:
             pass
     if not os.path.ismount(BACKUP_STORAGE):
