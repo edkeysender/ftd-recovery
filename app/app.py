@@ -578,10 +578,17 @@ def send_wol_packet(mac: str) -> None:
 # ---------- Storage health ----------
 
 def check_storage() -> dict:
-    """Verify the backup destination is mounted and writable."""
+    """Verify the backup destination is mounted and writable; auto-remount if disconnected."""
+    if not os.path.ismount(BACKUP_STORAGE):
+        # Drive may have been reconnected — try to remount via fstab entry.
+        try:
+            subprocess.run(["sudo", "/bin/mount", BACKUP_STORAGE],
+                           capture_output=True, timeout=10, check=True)
+        except Exception:
+            pass
     if not os.path.ismount(BACKUP_STORAGE):
         return {"ok": False, "path": BACKUP_STORAGE,
-                "error": "not mounted (check /mnt/backup and fstab)"}
+                "error": "backup drive not connected — reconnect it and wait a moment"}
     try:
         st = os.statvfs(BACKUP_STORAGE)
     except OSError as e:
@@ -1865,7 +1872,7 @@ async function refresh() {
     const s = d.storage || {};
     if (!s.ok) {
       banner.className = 'banner err';
-      banner.textContent = `⚠ Backup storage offline: ${s.path || ''} — ${s.error || 'unknown error'}. Backups will fail until this is fixed.`;
+      banner.textContent = `⚠ Backup drive offline — ${s.error || 'unknown error'}. Backups are paused.`;
     } else {
       banner.className = 'banner ok-info';
       banner.textContent = `Backup storage: ${s.path} · ${s.free_gb} GB free of ${s.total_gb} GB`;
