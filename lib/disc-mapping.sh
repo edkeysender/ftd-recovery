@@ -141,6 +141,24 @@ _mode2_adopt_partition() {
     ok "$dev mounted at $mountpoint"
 }
 
+# _disk_partition_info <disk> — compact summary of a disk's partitions for display.
+# Shows labels and mountpoints so identical-model disks can be told apart.
+_disk_partition_info() {
+    local disk=$1
+    local labels mounts
+    labels=$(lsblk -lno LABEL "$disk" 2>/dev/null | tail -n +2 | grep -v '^[[:space:]]*$' | paste -sd',' -)
+    mounts=$(lsblk -lno MOUNTPOINT "$disk" 2>/dev/null | tail -n +2 | grep -v '^[[:space:]]*$' | paste -sd',' -)
+    if [[ -n "$labels" && -n "$mounts" ]]; then
+        echo "$labels → $mounts"
+    elif [[ -n "$mounts" ]]; then
+        echo "mounted at $mounts"
+    elif [[ -n "$labels" ]]; then
+        echo "$labels (not mounted)"
+    else
+        echo "no partitions"
+    fi
+}
+
 # _mode3_format_disk [device] — wipe + format a whole disk, mount, bind.
 # If device is given (from auto-detect) the selection step is skipped.
 _mode3_format_disk() {
@@ -149,7 +167,7 @@ _mode3_format_disk() {
     if [[ -n "$preselected" ]]; then
         dev="$preselected"
     else
-        local -a d_names=() d_sizes=() d_models=() d_serials=()
+        local -a d_names=() d_sizes=() d_models=() d_infos=()
         local name short risky
 
         while read -r name; do
@@ -166,7 +184,7 @@ _mode3_format_disk() {
             d_names+=("$name")
             d_sizes+=("$(lsblk -dno SIZE "$name")")
             d_models+=("$(lsblk -dno MODEL "$name" | xargs || echo '?')")
-            d_serials+=("$(lsblk -dno SERIAL "$name" | xargs || echo '?')")
+            d_infos+=("$(_disk_partition_info "$name")")
         done < <(lsblk -dpno NAME)
 
         [[ ${#d_names[@]} -eq 0 ]] && die "no eligible drives found (system disk and drives in use are excluded)"
@@ -178,7 +196,7 @@ _mode3_format_disk() {
             for i in "${!d_names[@]}"; do
                 printf '  %s%d)%s %-15s  %-8s  %-28s  %s\n' \
                     "$BOLD" "$((i+1))" "$RESET" \
-                    "${d_names[$i]}" "${d_sizes[$i]}" "${d_models[$i]}" "${d_serials[$i]}"
+                    "${d_names[$i]}" "${d_sizes[$i]}" "${d_models[$i]}" "${d_infos[$i]}"
             done
             echo
         } >&2
