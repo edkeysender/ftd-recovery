@@ -33,6 +33,40 @@ def _safe_name(candidate) -> str:
     return candidate if _SAFE_NAME_RE.match(candidate) else ""
 
 
+async def _run_helper(*args: str, timeout: float = 10.0) -> tuple[int, bytes, bytes]:
+    """Run a sudo-NOPASSWD helper or any subprocess asynchronously.
+
+    Returns (returncode, stdout_bytes, stderr_bytes).
+    Raises asyncio.TimeoutError if the process doesn't finish within `timeout`.
+    Never raises CalledProcessError — callers inspect returncode themselves.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+    return proc.returncode or 0, out, err
+
+
+def _helper_error(returncode: int, stderr: bytes, args: tuple[str, ...]) -> subprocess.CalledProcessError:
+    """Build a CalledProcessError matching the shape callers used to see from subprocess.run(check=True)."""
+    return subprocess.CalledProcessError(returncode=returncode, cmd=list(args), output=b"", stderr=stderr)
+
+
+def _err_text(e: subprocess.CalledProcessError) -> str:
+    """Normalize CalledProcessError.stderr to a plain string for display."""
+    s = e.stderr
+    if isinstance(s, bytes):
+        s = s.decode(errors="replace")
+    return (s or "").strip() or str(e)
+
+
 def last_backup_at(mac: Optional[str]) -> Optional[float]:
     """Latest mtime across /srv/clonezilla-images/img-<MAC>{,-<timestamp>}/, or None."""
     if not mac:
@@ -73,19 +107,25 @@ IPXE_LOCAL = "#!ipxe\necho No recovery mode armed for ${mac}. Booting local disk
 
 GRUBCFG_HELPER = "/usr/local/bin/recovery-grubcfg"
 
-def write_grub_armed(mac: str, mode: str, image: Optional[str] = None) -> None:
+async def write_grub_armed(mac: str, mode: str, image: Optional[str] = None) -> None:
     """Write the per-MAC grub.cfg. Raises CalledProcessError on failure — callers handle rollback."""
     cmd = ["sudo", "-n", GRUBCFG_HELPER, "write", mac, mode]
     if image:
         cmd.append(image)
-    subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=10)
+    rc, _, err = await _run_helper(*cmd, timeout=10)
+    if rc != 0:
+        raise _helper_error(rc, err, tuple(cmd))
 
-def remove_grub_armed(mac: str) -> None:
+
+async def remove_grub_armed(mac: str) -> None:
+    cmd = ["sudo", "-n", GRUBCFG_HELPER, "remove", mac]
     try:
-        subprocess.run(["sudo", "-n", GRUBCFG_HELPER, "remove", mac],
-                       check=True, capture_output=True, text=True, timeout=10)
-    except subprocess.CalledProcessError as e:
-        print(f"[disarm] grubcfg remove failed for {mac}: {e.stderr.strip() or e}")
+        rc, _, err = await _run_helper(*cmd, timeout=10)
+    except asyncio.TimeoutError:
+        print(f"[disarm] grubcfg remove timed out for {mac}", flush=True)
+        return
+    if rc != 0:
+        print(f"[disarm] grubcfg remove failed for {mac}: {err.decode(errors='replace').strip() or rc}", flush=True)
 
 app = FastAPI(title="Recovery Status")
 
@@ -151,26 +191,27 @@ def save_state(state: dict) -> None:
     tmp.replace(STATE_FILE)
 
 
-def prune_expired(state: dict) -> tuple[dict, list[str]]:
+async def prune_expired(state: dict) -> tuple[dict, list[str]]:
     now = time.time()
     expired = [mac for mac, e in state["armed"].items() if e["expires_at"] <= now]
     for mac in expired:
         del state["armed"][mac]
         try:
-            run_allowlist("remove", mac)
-        except Exception as exc:
-            print(f"[prune] failed to remove {mac} from allowlist: {exc}")
-        remove_grub_armed(mac)
+            await run_allowlist("remove", mac)
+        except subprocess.CalledProcessError as exc:
+            print(f"[prune] failed to remove {mac} from allowlist: {_err_text(exc)}", flush=True)
+        await remove_grub_armed(mac)
     return state, expired
 
 
 # ---------- helpers ----------
 
-def run_allowlist(action: str, mac: str) -> None:
-    subprocess.run(
-        ["sudo", "-n", ALLOWLIST_HELPER, action, mac],
-        check=True, capture_output=True, text=True, timeout=10,
-    )
+async def run_allowlist(action: str, mac: str) -> None:
+    """Add/remove a MAC from the dnsmasq allowlist. Raises CalledProcessError on failure."""
+    cmd = ["sudo", "-n", ALLOWLIST_HELPER, action, mac]
+    rc, _, err = await _run_helper(*cmd, timeout=10)
+    if rc != 0:
+        raise _helper_error(rc, err, tuple(cmd))
 
 
 async def ping_host(host: str) -> tuple[bool, Optional[float]]:
@@ -577,15 +618,15 @@ def send_wol_packet(mac: str) -> None:
 
 # ---------- Storage health ----------
 
-def check_storage() -> dict:
+async def check_storage() -> dict:
     """Verify the backup destination is mounted and writable; auto-remount if disconnected."""
     if not os.path.ismount(BACKUP_STORAGE):
         # Drive may have been reconnected — mount underlying device then bind.
         try:
-            subprocess.run(["sudo", "/usr/local/bin/recovery-remount"],
-                           capture_output=True, timeout=15, check=True)
-        except Exception:
-            pass
+            rc, _, _ = await _run_helper("sudo", "/usr/local/bin/recovery-remount", timeout=15)
+        except asyncio.TimeoutError:
+            rc = 124
+        # Ignore rc — just check ismount again below
     if not os.path.ismount(BACKUP_STORAGE):
         return {"ok": False, "path": BACKUP_STORAGE,
                 "error": "backup drive not connected — reconnect it and wait a moment"}
@@ -611,49 +652,50 @@ _drive_health_cache: dict = {}
 _DRIVE_HEALTH_TTL = 60  # seconds
 
 
-def _backup_device() -> Optional[str]:
+async def _backup_device() -> Optional[str]:
     """Return the block disk device (e.g. /dev/sda, /dev/nvme1n1) backing the backup storage."""
     try:
-        bind_src = subprocess.check_output(
-            ["awk", '$2 == "/srv/clonezilla-images" && $1 !~ /^#/ {print $1; exit}', "/etc/fstab"],
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip()
-        if not bind_src:
+        rc, bind_src_b, _ = await _run_helper(
+            "awk", '$2 == "/srv/clonezilla-images" && $1 !~ /^#/ {print $1; exit}', "/etc/fstab",
+            timeout=2,
+        )
+        if rc != 0 or not bind_src_b.strip():
             return None
+        bind_src = bind_src_b.decode().strip()
         underlying = str(Path(bind_src).parent)
-        partition = subprocess.check_output(
-            ["findmnt", "-no", "SOURCE", underlying],
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip()
+        rc, partition_b, _ = await _run_helper("findmnt", "-no", "SOURCE", underlying, timeout=2)
+        if rc != 0 or not partition_b.strip():
+            return None
+        partition = partition_b.decode().strip()
         if not partition.startswith("/dev/"):
             return None
-        pkname = subprocess.check_output(
-            ["lsblk", "-no", "PKNAME", partition],
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip()
+        rc, pkname_b, _ = await _run_helper("lsblk", "-no", "PKNAME", partition, timeout=2)
+        if rc != 0 or not pkname_b.strip():
+            return None
+        pkname = pkname_b.decode().strip()
         return f"/dev/{pkname}" if pkname else partition
     except Exception:
         return None
 
 
-def _run_smartctl(device: str, extra_flags: list[str] | None = None) -> Optional[dict]:
+async def _run_smartctl(device: str, extra_flags: list[str] | None = None) -> Optional[dict]:
     flags = extra_flags or []
+    cmd = ["sudo", "/usr/sbin/smartctl", "-j", "-H", "-A", "-i"] + flags + [device]
     try:
-        proc = subprocess.run(
-            ["sudo", "/usr/sbin/smartctl", "-j", "-H", "-A", "-i"] + flags + [device],
-            capture_output=True, text=True, timeout=15,
-        )
-        return json.loads(proc.stdout)
-    except (FileNotFoundError, json.JSONDecodeError, subprocess.TimeoutExpired):
+        rc, out, _ = await _run_helper(*cmd, timeout=15)
+        return json.loads(out)
+    except (asyncio.TimeoutError, json.JSONDecodeError, FileNotFoundError):
+        return None
+    except Exception:
         return None
 
 
-def _device_transport(device: str) -> str:
+async def _device_transport(device: str) -> str:
     try:
-        return subprocess.check_output(
-            ["lsblk", "-no", "TRAN", device],
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip().lower()
+        rc, out, _ = await _run_helper("lsblk", "-no", "TRAN", device, timeout=2)
+        if rc != 0:
+            return ""
+        return out.decode().strip().lower()
     except Exception:
         return ""
 
@@ -711,21 +753,21 @@ def _parse_smartctl(data: dict, device: str, transport: str) -> dict:
     return result
 
 
-def get_drive_health() -> dict:
+async def get_drive_health() -> dict:
     now = time.time()
     cached = _drive_health_cache.get("result")
     if cached and now - _drive_health_cache.get("at", 0) < _DRIVE_HEALTH_TTL:
         return cached
 
-    device = _backup_device()
+    device = await _backup_device()
     if not device:
         result: dict = {"ok": False, "error": "could not determine backup drive device"}
         _drive_health_cache.update({"result": result, "at": now})
         return result
 
-    transport = _device_transport(device)
+    transport = await _device_transport(device)
 
-    data = _run_smartctl(device)
+    data = await _run_smartctl(device)
     if data is None:
         result = {"ok": False, "device": device,
                   "error": "smartctl not installed — run: sudo apt install smartmontools"}
@@ -736,7 +778,7 @@ def get_drive_health() -> dict:
 
     # USB bridge blocked passthrough — retry with SAT (works on many bridges)
     if transport == "usb" and result.get("health") == "UNKNOWN":
-        sat_data = _run_smartctl(device, ["-d", "sat"])
+        sat_data = await _run_smartctl(device, ["-d", "sat"])
         if sat_data:
             sat_result = _parse_smartctl(sat_data, device, transport)
             if sat_result.get("health") != "UNKNOWN" or sat_result.get("temperature_c") is not None:
@@ -758,7 +800,7 @@ async def api_status():
         asyncio.gather(*(arp_lookup(h["host"]) for h in hosts), return_exceptions=True),
     )
     state = load_state()
-    state, _ = prune_expired(state)
+    state, _ = await prune_expired(state)
     save_state(state)
     out = []
     for h, p, hn, arp in zip(hosts, ping_r, hn_r, arp_r):
@@ -786,13 +828,12 @@ async def api_status():
             "progress": get_progress(normalized),
         })
     return {"checked_at": time.time(), "now": time.time(), "hosts": out,
-            "storage": check_storage()}
+            "storage": await check_storage()}
 
 
 @app.get("/api/drive-health")
 async def api_drive_health():
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, get_drive_health)
+    return await get_drive_health()
 
 
 _IMG_RE = re.compile(r"^img-([0-9a-f]{2}(?:-[0-9a-f]{2}){5})(?:-(\d{8}-\d{4}))?$")
@@ -927,11 +968,13 @@ RMIMAGE_HELPER = "/usr/local/bin/recovery-rmimage"
 async def delete_image(name: str):
     if not name or not all(c.isalnum() or c in "._-" for c in name) or name in (".", ".."):
         raise HTTPException(status_code=400, detail="invalid image name")
+    cmd = ["sudo", "-n", RMIMAGE_HELPER, name]
     try:
-        subprocess.run(["sudo", "-n", RMIMAGE_HELPER, name],
-                       check=True, capture_output=True, text=True, timeout=60)
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=e.stderr.strip() or "rmimage failed")
+        rc, _, err = await _run_helper(*cmd, timeout=60)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="rmimage timed out")
+    if rc != 0:
+        raise HTTPException(status_code=500, detail=err.decode(errors="replace").strip() or "rmimage failed")
     return {"ok": True, "removed": name}
 
 
@@ -1016,14 +1059,14 @@ async def remove_host(ip: str):
             mac_n = None
     if mac_n:
         state = load_state()
-        state, _ = prune_expired(state)
+        state, _ = await prune_expired(state)
         if mac_n in state["armed"]:
             del state["armed"][mac_n]
             try:
-                run_allowlist("remove", mac_n)
+                await run_allowlist("remove", mac_n)
             except subprocess.CalledProcessError as exc:
-                print(f"[remove_host] allowlist remove failed for {mac_n}: {exc.stderr}")
-            remove_grub_armed(mac_n)
+                print(f"[remove_host] allowlist remove failed for {mac_n}: {_err_text(exc)}")
+            await remove_grub_armed(mac_n)
             save_state(state)
     hosts = [h for h in hosts if h.get("host") != ip]
     save_hosts(hosts)
@@ -1082,24 +1125,24 @@ async def arm_host(ip: str, payload: ArmRequest):
         raise HTTPException(status_code=400, detail="no MAC available — set it in hosts.yml or ping the host first")
 
     state = load_state()
-    state, _ = prune_expired(state)
+    state, _ = await prune_expired(state)
     save_state(state)  # persist any pruning side-effects
 
     expires_at = time.time() + ARM_TTL
 
     # 1. Write per-MAC grub.cfg first (idempotent — overwrites if exists)
     try:
-        write_grub_armed(mac, payload.mode, payload.image)
+        await write_grub_armed(mac, payload.mode, payload.image)
     except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"grub config write failed: {e.stderr.strip() or e}")
+        raise HTTPException(status_code=500, detail=f"grub config write failed: {_err_text(e)}")
 
     # 2. Add to dnsmasq allowlist
     try:
-        run_allowlist("add", mac)
+        await run_allowlist("add", mac)
     except subprocess.CalledProcessError as e:
         # Roll back step 1.
-        remove_grub_armed(mac)
-        raise HTTPException(status_code=500, detail=f"allowlist add failed: {e.stderr.strip() or e}")
+        await remove_grub_armed(mac)
+        raise HTTPException(status_code=500, detail=f"allowlist add failed: {_err_text(e)}")
 
     # 3. Persist state last
     state["armed"][mac] = {
@@ -1114,10 +1157,10 @@ async def arm_host(ip: str, payload: ArmRequest):
         # State save failure: roll back the real-world side effects so we don't
         # leave the host armed-without-record.
         try:
-            run_allowlist("remove", mac)
+            await run_allowlist("remove", mac)
         except Exception:
             pass
-        remove_grub_armed(mac)
+        await remove_grub_armed(mac)
         raise HTTPException(status_code=500, detail=f"state save failed: {e}")
 
     print(f"[arm] {ip} ({mac}) -> {payload.mode} (image={payload.image or 'own'}), expires {expires_at}")
@@ -1127,15 +1170,15 @@ async def arm_host(ip: str, payload: ArmRequest):
 @app.delete("/api/host/{ip}/mode")
 async def disarm_host(ip: str):
     state = load_state()
-    state, _ = prune_expired(state)
+    state, _ = await prune_expired(state)
     macs = [m for m, e in state["armed"].items() if e.get("host_ip") == ip]
     for m in macs:
         del state["armed"][m]
         try:
-            run_allowlist("remove", m)
+            await run_allowlist("remove", m)
         except subprocess.CalledProcessError as e:
-            print(f"[disarm] allowlist remove failed for {m}: {e.stderr}")
-        remove_grub_armed(m)
+            print(f"[disarm] allowlist remove failed for {m}: {_err_text(e)}")
+        await remove_grub_armed(m)
     save_state(state)
     print(f"[disarm] {ip} -> cleared {macs}")
     return {"ok": True, "disarmed_macs": macs}
@@ -1149,16 +1192,16 @@ async def disarm_mac(mac: str):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     state = load_state()
-    state, _ = prune_expired(state)
+    state, _ = await prune_expired(state)
     cleared = False
     if mac_n in state["armed"]:
         del state["armed"][mac_n]
         cleared = True
         try:
-            run_allowlist("remove", mac_n)
+            await run_allowlist("remove", mac_n)
         except subprocess.CalledProcessError as e:
-            print(f"[disarm-mac] allowlist remove failed for {mac_n}: {e.stderr}")
-    remove_grub_armed(mac_n)
+            print(f"[disarm-mac] allowlist remove failed for {mac_n}: {_err_text(e)}")
+    await remove_grub_armed(mac_n)
     save_state(state)
     print(f"[disarm-mac] {mac_n} cleared={cleared}")
     return {"ok": True, "mac": mac_n, "cleared": cleared}
@@ -1400,14 +1443,14 @@ async def api_scan():
         if old_mac_n:
             if state is None:
                 state = load_state()
-                state, _ = prune_expired(state)
+                state, _ = await prune_expired(state)
             if old_mac_n in state["armed"]:
                 del state["armed"][old_mac_n]
                 try:
-                    run_allowlist("remove", old_mac_n)
+                    await run_allowlist("remove", old_mac_n)
                 except subprocess.CalledProcessError as exc:
-                    print(f"[scan-replace] allowlist remove failed for {old_mac_n}: {exc.stderr}")
-                remove_grub_armed(old_mac_n)
+                    print(f"[scan-replace] allowlist remove failed for {old_mac_n}: {_err_text(exc)}")
+                await remove_grub_armed(old_mac_n)
             known_macs.discard(old_mac_n)
         host["mac"] = new_mac
         host["name"] = new_name
@@ -1508,7 +1551,7 @@ async def ipxe_boot(mac: str = ""):
         return PlainTextResponse(IPXE_LOCAL, media_type="text/plain")
 
     state = load_state()
-    state, _ = prune_expired(state)
+    state, _ = await prune_expired(state)
     entry = state["armed"].get(mac_n)
     if not entry:
         save_state(state)
@@ -1520,9 +1563,9 @@ async def ipxe_boot(mac: str = ""):
     del state["armed"][mac_n]
     save_state(state)
     try:
-        run_allowlist("remove", mac_n)
+        await run_allowlist("remove", mac_n)
     except subprocess.CalledProcessError as e:
-        print(f"[ipxe] allowlist remove failed for {mac_n}: {e.stderr}")
+        print(f"[ipxe] allowlist remove failed for {mac_n}: {_err_text(e)}")
 
     ipxe_file = IPXE_DIR / MODE_TO_IPXE_FILE[mode]
     try:
