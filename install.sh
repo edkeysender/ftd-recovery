@@ -215,10 +215,14 @@ fi
 
 # ── Step 7: helper scripts + sudoers ────────────────────────────────────────
 log "installing helper scripts and sudoers fragments"
+mkdir -p /usr/local/lib/ftd-recovery
+install -m 0644 "$SCRIPT_DIR/lib/common.sh"       /usr/local/lib/ftd-recovery/common.sh
+install -m 0644 "$SCRIPT_DIR/lib/disc-mapping.sh" /usr/local/lib/ftd-recovery/disc-mapping.sh
 render "$SCRIPT_DIR/helpers/recovery-grubcfg" /usr/local/bin/recovery-grubcfg 0755 "SERVER_IP=$SERVER_IP"
-install -m 0755 "$SCRIPT_DIR/helpers/recovery-allowlist" /usr/local/bin/recovery-allowlist
-install -m 0755 "$SCRIPT_DIR/helpers/recovery-rmimage"   /usr/local/bin/recovery-rmimage
-install -m 0755 "$SCRIPT_DIR/helpers/recovery-remount"   /usr/local/bin/recovery-remount
+install -m 0755 "$SCRIPT_DIR/helpers/recovery-allowlist"     /usr/local/bin/recovery-allowlist
+install -m 0755 "$SCRIPT_DIR/helpers/recovery-rmimage"       /usr/local/bin/recovery-rmimage
+install -m 0755 "$SCRIPT_DIR/helpers/recovery-remount"       /usr/local/bin/recovery-remount
+install -m 0755 "$SCRIPT_DIR/helpers/recovery-change-storage" /usr/local/bin/recovery-change-storage
 
 for f in ftd-grubcfg ftd-rmimage recovery-interface; do
     # Rewrite the leading user token to whatever SERVICE_USER is.

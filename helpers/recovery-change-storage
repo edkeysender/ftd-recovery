@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Switch the backup storage drive without reinstalling.
+# Usage: sudo recovery-change-storage
+#
+# Tears down the current storage mount, runs the interactive storage
+# picker (same as the installer), updates fstab, and restarts the app.
+# Existing backup images on the old drive are left untouched.
+
+set -euo pipefail
+
+LIB_DIR="/usr/local/lib/ftd-recovery"
+# shellcheck source=/usr/local/lib/ftd-recovery/common.sh
+source "$LIB_DIR/common.sh"
+# shellcheck source=/usr/local/lib/ftd-recovery/disc-mapping.sh
+source "$LIB_DIR/disc-mapping.sh"
+
+require_root
+
+echo
+echo "${BOLD}${CYAN}FTD Recovery — change backup storage${RESET}"
+echo
+
+# ── Step 1: tear down current storage ───────────────────────────────────────
+log "removing current storage configuration"
+
+# Locate the bind source so we can find the underlying mount point.
+bind_src=$(awk '$2 == "/srv/clonezilla-images" && $1 !~ /^#/ {print $1; exit}' /etc/fstab || true)
+underlying=""
+if [[ -n "$bind_src" ]]; then
+    underlying=$(dirname "$bind_src")
+fi
+
+# Unmount in order: bind first, then underlying device.
+if mountpoint -q "$STORAGE_BIND" 2>/dev/null; then
+    umount "$STORAGE_BIND"
+    ok "unmounted $STORAGE_BIND"
+fi
+if [[ -n "$underlying" ]] && mountpoint -q "$underlying" 2>/dev/null; then
+    umount "$underlying"
+    ok "unmounted $underlying"
+fi
+
+# Remove old fstab entries for the bind and underlying mount.
+sed -i "\|[[:space:]]${STORAGE_BIND}[[:space:]]|d" /etc/fstab
+if [[ -n "$underlying" ]]; then
+    sed -i "\|[[:space:]]${underlying}[[:space:]]|d" /etc/fstab
+fi
+systemctl daemon-reload || true
+ok "old fstab entries removed"
+
+# ── Step 2: pick new storage ─────────────────────────────────────────────────
+choose_storage
+
+# ── Step 3: restart the app ──────────────────────────────────────────────────
+systemctl restart recovery-interface
+ok "recovery-interface restarted"
+
+echo
+echo "${BOLD}${GREEN}Storage changed.${RESET} New path: $STORAGE_UNDERLYING"
+echo "Existing images on the old drive were not touched."

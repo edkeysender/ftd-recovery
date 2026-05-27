@@ -1,3 +1,4 @@
 ftd ALL=(root) NOPASSWD: /usr/local/bin/recovery-allowlist
 ftd ALL=(root) NOPASSWD: /usr/sbin/arp-scan
 ftd ALL=(root) NOPASSWD: /usr/local/bin/recovery-remount
+ftd ALL=(root) NOPASSWD: /usr/local/bin/recovery-change-storage
