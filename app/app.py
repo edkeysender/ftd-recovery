@@ -93,7 +93,9 @@ def last_backup_at(mac: Optional[str]) -> Optional[float]:
 
 PING_TIMEOUT = 1
 HOSTNAME_TTL = 300
-ARM_TTL = 300  # 5 minutes
+ARM_TTL_DEFAULT = 900   # 15 minutes — most fleet PCs take 60-180s for cold WoL+POST+PXE
+ARM_TTL_MIN = 60        # 1 minute floor (used by both /api/host/{ip}/mode and /api/arm-batch)
+ARM_TTL_MAX = 3600      # 1 hour cap
 PROGRESS_TTL = 120  # progress entries older than this are stale and hidden
 INTERFACE = os.environ.get("RECOVERY_IFACE", "eth0")
 
@@ -1096,6 +1098,7 @@ async def wake(ip: str):
 class ArmRequest(BaseModel):
     mode: Mode
     image: Optional[str] = None  # restore-only: override image dir name (e.g. "img-aa-bb-..."), default = host's own
+    ttl_seconds: int = Field(default=ARM_TTL_DEFAULT, ge=ARM_TTL_MIN, le=ARM_TTL_MAX)
 
 
 def _resolve_mac_and_persist(target: dict, hosts: list[dict], arp_mac: Optional[str]) -> Optional[str]:
@@ -1108,6 +1111,48 @@ def _resolve_mac_and_persist(target: dict, hosts: list[dict], arp_mac: Optional[
         target["mac"] = mac
         save_hosts(hosts)
     return mac
+
+
+async def _arm_one_mac(
+    state: dict,
+    mac: str,
+    mode: str,
+    image: Optional[str],
+    ttl_seconds: int,
+    host_ip: Optional[str] = None,
+) -> dict:
+    """Perform the three rollback-able arm steps for a single MAC.
+
+    Mutates `state["armed"][mac]` on success. Raises HTTPException on any
+    irrecoverable failure (after rollback). Returns the armed entry.
+
+    State persistence is the CALLER's responsibility — single-host arms save
+    once at the end of arm_host(); batch arms save once after all macs.
+    """
+    expires_at = time.time() + ttl_seconds
+
+    # 1. Write per-MAC grub.cfg (idempotent — overwrites if exists).
+    try:
+        await write_grub_armed(mac, mode, image)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"grub config write failed: {_err_text(e)}")
+
+    # 2. Add to dnsmasq allowlist; on failure roll back step 1.
+    try:
+        await run_allowlist("add", mac)
+    except subprocess.CalledProcessError as e:
+        await remove_grub_armed(mac)
+        raise HTTPException(status_code=500, detail=f"allowlist add failed: {_err_text(e)}")
+
+    entry = {
+        "mode": mode,
+        "armed_at": time.time(),
+        "expires_at": expires_at,
+    }
+    if host_ip:
+        entry["host_ip"] = host_ip
+    state["armed"][mac] = entry
+    return entry
 
 
 @app.post("/api/host/{ip}/mode")
@@ -1128,34 +1173,12 @@ async def arm_host(ip: str, payload: ArmRequest):
     state, _ = await prune_expired(state)
     save_state(state)  # persist any pruning side-effects
 
-    expires_at = time.time() + ARM_TTL
+    entry = await _arm_one_mac(state, mac, payload.mode, payload.image, payload.ttl_seconds, host_ip=ip)
 
-    # 1. Write per-MAC grub.cfg first (idempotent — overwrites if exists)
-    try:
-        await write_grub_armed(mac, payload.mode, payload.image)
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"grub config write failed: {_err_text(e)}")
-
-    # 2. Add to dnsmasq allowlist
-    try:
-        await run_allowlist("add", mac)
-    except subprocess.CalledProcessError as e:
-        # Roll back step 1.
-        await remove_grub_armed(mac)
-        raise HTTPException(status_code=500, detail=f"allowlist add failed: {_err_text(e)}")
-
-    # 3. Persist state last
-    state["armed"][mac] = {
-        "mode": payload.mode,
-        "armed_at": time.time(),
-        "expires_at": expires_at,
-        "host_ip": ip,
-    }
     try:
         save_state(state)
     except Exception as e:
-        # State save failure: roll back the real-world side effects so we don't
-        # leave the host armed-without-record.
+        # Roll back the real-world side effects so we don't leave armed-without-record.
         try:
             await run_allowlist("remove", mac)
         except Exception:
@@ -1163,8 +1186,62 @@ async def arm_host(ip: str, payload: ArmRequest):
         await remove_grub_armed(mac)
         raise HTTPException(status_code=500, detail=f"state save failed: {e}")
 
-    print(f"[arm] {ip} ({mac}) -> {payload.mode} (image={payload.image or 'own'}), expires {expires_at}")
-    return {"ok": True, "mac": mac, "mode": payload.mode, "image": payload.image, "expires_at": expires_at}
+    print(f"[arm] {ip} ({mac}) -> {payload.mode} (image={payload.image or 'own'}), expires {entry['expires_at']}")
+    return {"ok": True, "mac": mac, "mode": payload.mode, "image": payload.image, "expires_at": entry["expires_at"]}
+
+
+class ArmBatchRequest(BaseModel):
+    mode: Mode
+    macs: list[str] = Field(min_length=1, max_length=100)
+    ttl_seconds: int = Field(default=ARM_TTL_DEFAULT, ge=ARM_TTL_MIN, le=ARM_TTL_MAX)
+    image: Optional[str] = None  # restore-only; all macs share the same image
+
+
+class ArmBatchResult(BaseModel):
+    armed: list[str]
+    failed: dict[str, str]
+
+
+@app.post("/api/arm-batch", response_model=ArmBatchResult)
+async def arm_batch(req: ArmBatchRequest) -> ArmBatchResult:
+    if req.mode == "recovery" and not req.image:
+        raise HTTPException(status_code=400, detail="image required for recovery mode")
+
+    state = load_state()
+    state, _ = await prune_expired(state)
+    save_state(state)
+
+    armed: list[str] = []
+    failed: dict[str, str] = {}
+
+    for raw_mac in req.macs:
+        try:
+            mac = normalize_mac(raw_mac)
+        except ValueError as exc:
+            failed[raw_mac] = f"invalid mac: {exc}"
+            continue
+        try:
+            await _arm_one_mac(state, mac, req.mode, req.image, req.ttl_seconds, host_ip=None)
+            armed.append(mac)
+        except HTTPException as exc:
+            # _arm_one_mac already rolled back step 1 if step 2 failed.
+            failed[mac] = str(exc.detail)
+            continue
+
+    try:
+        save_state(state)
+    except Exception as exc:
+        # State save failure after partial arm: roll back EVERY mac we just armed.
+        for mac in armed:
+            try:
+                await run_allowlist("remove", mac)
+            except Exception:
+                pass
+            await remove_grub_armed(mac)
+        raise HTTPException(status_code=500, detail=f"state save failed: {exc}")
+
+    print(f"[arm-batch] {req.mode} ttl={req.ttl_seconds}s armed={len(armed)} failed={len(failed)}")
+    return ArmBatchResult(armed=armed, failed=failed)
 
 
 @app.delete("/api/host/{ip}/mode")
@@ -1686,6 +1763,26 @@ INDEX_HTML = """<!doctype html>
   .addDevices-row .info .name input { background:transparent; color:#ddd; border:1px solid transparent; padding:2px 4px; border-radius:3px; font:inherit; width:100%; max-width:260px; }
   .addDevices-row .info .name input:hover { border-color:#333; }
   .addDevices-row .info .name input:focus { outline:none; border-color:#3b82f6; background:#1a1a1a; }
+  button.primary { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+  button.primary:hover:not(:disabled) { background:#2f7fff; border-color:#2f7fff; }
+  .batch-bar {
+    display: flex;
+    align-items: center;
+    gap: 1em;
+    padding: 0.5em 1em;
+    margin-bottom: 0.5em;
+    background: #1a2035;
+    border: 1px solid #1f6feb44;
+    border-radius: 4px;
+    font-size: 13px;
+    max-width: 1200px;
+  }
+  .batch-bar[hidden] { display: none; }
+  .batch-bar select { background:#222; color:#ddd; border:1px solid #333; border-radius:4px; padding:3px 6px; font:inherit; font-size:12px; cursor:pointer; }
+  .batch-bar select:focus { outline:none; border-color:#1f6feb; }
+  .batch-col { width: 2em; text-align: center; }
+  .host-check { cursor: pointer; accent-color: #1f6feb; }
+  .host-check:disabled { cursor: not-allowed; opacity: 0.4; }
 </style>
 </head>
 <body>
@@ -1726,8 +1823,23 @@ INDEX_HTML = """<!doctype html>
       </div>
     </div>
   </div>
+  <div id="batchBar" class="batch-bar" hidden>
+    <span id="batchCount">0 selected</span>
+    <label>
+      Auto-disarm after:
+      <select id="batchTTL">
+        <option value="300">5 min</option>
+        <option value="900" selected>15 min</option>
+        <option value="1800">30 min</option>
+        <option value="3600">60 min</option>
+      </select>
+    </label>
+    <button id="batchBackupBtn" class="primary" disabled>Arm selected for Backup</button>
+    <button id="batchClearBtn">Clear selection</button>
+  </div>
   <table>
     <thead><tr>
+      <th class="batch-col"><input type="checkbox" id="selectAllHosts" title="Select all"></th>
       <th>Status</th><th>Name</th><th>IP</th><th>MAC</th><th>Latency</th><th>Last Backup</th><th>Actions</th>
     </tr></thead>
     <tbody id="rows"></tbody>
@@ -2008,7 +2120,7 @@ async function refresh() {
     serverNow = d.now; lastFetch = Date.now() / 1000;
     const rows = document.getElementById('rows');
     if (!d.hosts.length) {
-      rows.innerHTML = '<tr><td colspan="7" class="muted">No devices in the backup list yet. Click "Add backup devices" to scan and pick.</td></tr>';
+      rows.innerHTML = '<tr><td colspan="8" class="muted">No devices in the backup list yet. Click "Add backup devices" to scan and pick.</td></tr>';
     } else {
       const storageOk = !!(d.storage && d.storage.ok);
       rows.innerHTML = d.hosts.map(h => {
@@ -2025,6 +2137,13 @@ async function refresh() {
                        : '';
         return `
           <tr class="${h.online ? 'online' : 'offline'}">
+            <td class="batch-col">${
+              h.mac && !h.armed && !(h.progress && h.progress.status !== 'completed' && h.progress.status !== 'failed')
+                ? `<input type="checkbox" class="host-check" data-mac="${escapeHtml(h.mac)}">`
+                : `<input type="checkbox" class="host-check" disabled title="${
+                    !h.mac ? 'No MAC known' : h.armed ? 'Already armed' : 'Job in progress'
+                  }">`
+            }</td>
             <td><span class="dot"></span>${h.online ? 'Online' : 'Offline'}</td>
             <td><input class="name-edit" data-ip="${h.host}" data-original="${safeName}" value="${safeName}">${catBadge}</td>
             <td class="mac">${h.host}</td>
@@ -2057,6 +2176,95 @@ async function refresh() {
           else arm(ip, a, btn);
         });
       });
+
+      // Batch arm wiring.
+      const batchBar = document.getElementById('batchBar');
+      const batchCount = document.getElementById('batchCount');
+      const batchBackupBtn = document.getElementById('batchBackupBtn');
+      const batchClearBtn = document.getElementById('batchClearBtn');
+      const batchTTL = document.getElementById('batchTTL');
+      const selectAllHosts = document.getElementById('selectAllHosts');
+
+      function selectedMacs() {
+        return Array.from(rows.querySelectorAll('input.host-check:checked'))
+          .map(el => el.dataset.mac)
+          .filter(Boolean);
+      }
+
+      function updateBatchBar() {
+        const n = selectedMacs().length;
+        batchCount.textContent = n + ' selected';
+        batchBackupBtn.disabled = (n === 0) || !storageOk;
+        batchBackupBtn.title = !storageOk
+          ? 'Backup storage offline — fix the storage banner first'
+          : (n === 0 ? 'Tick at least one row' : '');
+        batchBar.hidden = (n === 0);
+      }
+
+      rows.querySelectorAll('input.host-check').forEach(cb => {
+        cb.addEventListener('change', updateBatchBar);
+      });
+
+      selectAllHosts.onchange = () => {
+        rows.querySelectorAll('input.host-check:not(:disabled)').forEach(cb => {
+          cb.checked = selectAllHosts.checked;
+        });
+        updateBatchBar();
+      };
+
+      batchClearBtn.onclick = () => {
+        rows.querySelectorAll('input.host-check').forEach(cb => { cb.checked = false; });
+        selectAllHosts.checked = false;
+        updateBatchBar();
+      };
+
+      batchBackupBtn.onclick = async () => {
+        const macs = selectedMacs();
+        if (!macs.length) return;
+        const ttl = parseInt(batchTTL.value, 10);
+        if (!window.confirm(
+          'Arm ' + macs.length + ' host(s) for BACKUP\n\n' +
+          'Auto-disarm after: ' + Math.round(ttl / 60) + ' min\n\n' +
+          'Continue?'
+        )) return;
+        batchBackupBtn.disabled = true;
+        const orig = batchBackupBtn.textContent;
+        batchBackupBtn.textContent = 'Arming…';
+        try {
+          const r = await fetch('/api/arm-batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: 'backup', macs, ttl_seconds: ttl }),
+          });
+          const data = await r.json();
+          if (!r.ok) {
+            toast(data.detail || 'batch arm failed', 'err');
+            return;
+          }
+          const failedCount = Object.keys(data.failed || {}).length;
+          if (failedCount === 0) {
+            toast('Armed ' + data.armed.length + ' host(s) for backup', 'ok');
+          } else {
+            toast('Armed ' + data.armed.length + ', failed ' + failedCount, 'warn');
+            alert(
+              'Armed: ' + data.armed.length + '\n' +
+              'Failed: ' + failedCount + '\n\n' +
+              Object.entries(data.failed).map(([m, e]) => m + ': ' + e).join('\n')
+            );
+          }
+          rows.querySelectorAll('input.host-check').forEach(cb => { cb.checked = false; });
+          selectAllHosts.checked = false;
+          updateBatchBar();
+          refresh();
+        } catch (e) {
+          toast('batch arm error: ' + e.message, 'err');
+        } finally {
+          batchBackupBtn.textContent = orig;
+          batchBackupBtn.disabled = false;
+        }
+      };
+
+      updateBatchBar();  // initial state after each refresh
     }
     document.getElementById('meta').textContent =
       'Last check: ' + new Date(d.checked_at * 1000).toLocaleTimeString();
