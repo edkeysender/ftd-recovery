@@ -1655,7 +1655,6 @@ INDEX_HTML = """<!doctype html>
     <button class="scan" id="addDevicesBtn">+ Add backup devices</button>
   </div>
   <div class="banner" id="storageBanner"></div>
-  <div class="banner" id="healthBanner"></div>
   <div class="banner" id="warnBanner"></div>
   <div class="modal-bg" id="restoreModal">
     <div class="modal">
@@ -2019,12 +2018,12 @@ async function refresh() {
       'Last check: ' + new Date(d.checked_at * 1000).toLocaleTimeString();
     const banner = document.getElementById('storageBanner');
     const s = d.storage || {};
+    window._lastStorage = s;
     if (!s.ok) {
       banner.className = 'banner err';
       banner.textContent = `⚠ Backup drive offline — ${s.error || 'unknown error'}. Backups are paused.`;
     } else {
-      banner.className = 'banner ok-info';
-      banner.textContent = `Backup storage: ${s.path} · ${s.free_gb} GB free of ${s.total_gb} GB`;
+      renderStorageBanner(banner, s);
     }
   } catch (e) {
     document.getElementById('meta').textContent = 'Error: ' + e.message;
@@ -2273,35 +2272,39 @@ async function refreshBackups() {
   } catch (e) { /* silent */ }
 }
 
-async function refreshDriveHealth() {
-  const banner = document.getElementById('healthBanner');
-  try {
-    const r = await fetch('/api/drive-health');
-    if (!r.ok) { banner.className = 'banner'; return; }
-    const h = await r.json();
+let lastDriveHealth = null;
 
-    if (!h.ok) { banner.className = 'banner'; return; }
-
-    const model = h.model ? `${h.model} · ` : '';
-    const temp  = h.temperature_c != null ? ` · ${h.temperature_c}°C` : '';
-    const hours = h.power_on_hours  != null ? ` · ${h.power_on_hours.toLocaleString()} hrs on` : '';
-    const spare = h.nvme ? ` · ${h.nvme.available_spare_pct}% spare` : '';
-
+function renderStorageBanner(banner, s) {
+  const h = lastDriveHealth;
+  let parts = [`${s.free_gb} GB free of ${s.total_gb} GB`];
+  if (h && h.ok) {
+    if (h.model)            parts.push(h.model);
     if (h.health === 'FAILED') {
       banner.className = 'banner err';
-      banner.textContent = `⚠ Drive health FAILED — ${model.replace(' · ','')}. Consider replacing it before data is lost.`;
-    } else if (h.health === 'PASSED') {
-      banner.className = 'banner ok-info';
-      banner.textContent = `Drive: ${model}SMART OK${temp}${hours}${spare}`;
-    } else {
-      // UNKNOWN — typically USB bridge blocking passthrough
-      const reason = (h.warnings && h.warnings.length) ? ' (USB bridge blocks SMART)' : '';
-      banner.className = 'banner ok-info';
-      banner.textContent = `Drive: ${model}SMART unavailable${reason}${temp}`;
+      banner.textContent = `⚠ Drive health FAILED — ${h.model || 'backup drive'}. Consider replacing it before data is lost.`;
+      return;
     }
-  } catch (e) {
-    banner.className = 'banner';
+    if (h.health === 'PASSED')              parts.push('SMART OK');
+    else if (h.health === 'UNKNOWN')        parts.push('SMART unavailable');
+    if (h.temperature_c != null)            parts.push(`${h.temperature_c}°C`);
+    if (h.power_on_hours != null)           parts.push(`${h.power_on_hours.toLocaleString()} hrs on`);
+    if (h.nvme)                             parts.push(`${h.nvme.available_spare_pct}% spare`);
   }
+  banner.className = 'banner ok-info';
+  banner.textContent = parts.join(' · ');
+}
+
+async function refreshDriveHealth() {
+  try {
+    const r = await fetch('/api/drive-health');
+    if (!r.ok) return;
+    const h = await r.json();
+    lastDriveHealth = h.ok ? h : null;
+    // Re-render storage banner if it's currently visible
+    const banner = document.getElementById('storageBanner');
+    const s = window._lastStorage;
+    if (s && s.ok) renderStorageBanner(banner, s);
+  } catch (e) { /* silent */ }
 }
 
 refresh();
