@@ -1207,6 +1207,15 @@ async def arm_batch(req: ArmBatchRequest) -> ArmBatchResult:
     if req.mode == "recovery" and not req.image:
         raise HTTPException(status_code=400, detail="image required for recovery mode")
 
+    hosts = load_hosts()
+    mac_to_ip: dict[str, str] = {}
+    for h in hosts:
+        if h.get("mac") and h.get("host"):
+            try:
+                mac_to_ip[normalize_mac(h["mac"])] = h["host"]
+            except ValueError:
+                continue
+
     state = load_state()
     state, _ = await prune_expired(state)
     save_state(state)
@@ -1221,7 +1230,10 @@ async def arm_batch(req: ArmBatchRequest) -> ArmBatchResult:
             failed[raw_mac] = f"invalid mac: {exc}"
             continue
         try:
-            await _arm_one_mac(state, mac, req.mode, req.image, req.ttl_seconds, host_ip=None)
+            await _arm_one_mac(
+                state, mac, req.mode, req.image, req.ttl_seconds,
+                host_ip=mac_to_ip.get(mac),
+            )
             armed.append(mac)
         except HTTPException as exc:
             # _arm_one_mac already rolled back step 1 if step 2 failed.
@@ -1938,7 +1950,9 @@ async function arm(ip, mode, btn, image) {
     const d = await r.json();
     if (!r.ok) throw new Error(d.detail || 'arm failed');
     const imgNote = image ? ` from ${image}` : '';
-    toast(`${mode} armed (${d.mac})${imgNote} for 5 min`, 'ok');
+    const remainSecs = Math.max(0, Math.round(d.expires_at - Date.now() / 1000));
+    const mins = Math.round(remainSecs / 60);
+    toast(`${mode} armed (${d.mac})${imgNote} for ${mins} min`, 'ok');
     refresh();
   } catch (e) { toast('Error: ' + e.message, 'err'); }
   finally { btn.textContent = orig; btn.disabled = false; }
