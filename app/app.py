@@ -135,6 +135,9 @@ _hostname_cache: dict[str, tuple[float, Optional[str]]] = {}
 
 # Concurrency locks — one per mutable file.
 # Always acquire _hosts_lock BEFORE _state_lock when both are needed.
+# REQUIRES uvicorn --workers 1 (the default). With multiple workers each
+# process has its own locks and the load/save race returns; keep the unit
+# file's ExecStart at one worker.
 _hosts_lock = asyncio.Lock()
 _state_lock = asyncio.Lock()
 
@@ -1539,6 +1542,7 @@ async def api_scan():
         # Detect MAC changes: same IP, different MAC = host was swapped.
         by_ip = {h["host"]: h for h in hosts}
         state = None
+        mac_filled = False
         for ip, new_mac in found:
             if ip in skip_ips:
                 continue
@@ -1549,6 +1553,7 @@ async def api_scan():
             if not old_mac_raw:
                 host["mac"] = new_mac
                 known_macs.add(new_mac)
+                mac_filled = True
                 continue
             try:
                 old_mac_n = normalize_mac(old_mac_raw)
@@ -1650,7 +1655,7 @@ async def api_scan():
         if drop_ids:
             hosts = [h for h in hosts if id(h) not in drop_ids]
 
-        if renamed or replaced or removed:
+        if renamed or replaced or removed or mac_filled:
             save_hosts(hosts)
 
     return {"ok": True, "added": added, "renamed": renamed,
