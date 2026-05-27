@@ -20,15 +20,33 @@ echo
 echo "${BOLD}${CYAN}FTD Recovery — change backup storage${RESET}"
 echo
 
-# ── Step 1: tear down current storage ───────────────────────────────────────
-log "removing current storage configuration"
-
-# Locate the bind source so we can find the underlying mount point.
+# ── Show current storage and confirm ────────────────────────────────────────
 bind_src=$(awk '$2 == "/srv/clonezilla-images" && $1 !~ /^#/ {print $1; exit}' /etc/fstab || true)
 underlying=""
 if [[ -n "$bind_src" ]]; then
     underlying=$(dirname "$bind_src")
 fi
+
+echo "${BOLD}Current backup storage:${RESET}"
+if mountpoint -q "$STORAGE_BIND" 2>/dev/null; then
+    st=$(df -h "$STORAGE_BIND" | awk 'NR==2 {printf "%s used of %s", $3, $2}')
+    echo "  path : $STORAGE_BIND"
+    echo "  usage: $st"
+    [[ -n "$underlying" ]] && echo "  mount: $underlying"
+else
+    echo "  ${YELLOW}not currently mounted${RESET}"
+    [[ -n "$underlying" ]] && echo "  configured mount: $underlying"
+fi
+echo
+warn "This will unmount the current drive and let you pick a new one."
+warn "Existing backup images on the old drive will not be deleted."
+echo
+if ! confirm "Continue?" "n"; then
+    echo "Aborted."; exit 0
+fi
+
+# ── Step 1: tear down current storage ───────────────────────────────────────
+log "removing current storage configuration"
 
 # Unmount in order: bind first, then underlying device.
 if mountpoint -q "$STORAGE_BIND" 2>/dev/null; then
