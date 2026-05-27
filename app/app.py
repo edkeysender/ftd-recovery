@@ -70,7 +70,13 @@ def _err_text(e: subprocess.CalledProcessError) -> str:
 
 
 def last_backup_at(mac: Optional[str]) -> Optional[float]:
-    """Latest mtime across /srv/clonezilla-images/img-<MAC>{,-<timestamp>}/, or None."""
+    """Mtime of the latest .last-success sentinel under /srv/clonezilla-images/img-<MAC>{,-<timestamp>}/.
+
+    Returns None when no successful backup has completed (or the storage
+    isn't mounted). A backup that touched files but failed has no sentinel,
+    so the UI correctly shows 'never' rather than a misleading green
+    timestamp for the partial-write attempt.
+    """
     if not mac:
         return None
     base = Path(BACKUP_STORAGE)
@@ -82,13 +88,17 @@ def last_backup_at(mac: Optional[str]) -> Optional[float]:
         for entry in base.iterdir():
             if not entry.is_dir():
                 continue
-            if entry.name == prefix or entry.name.startswith(f"{prefix}-"):
-                try:
-                    m = entry.stat().st_mtime
-                    if m > latest:
-                        latest = m
-                except OSError:
-                    continue
+            if entry.name != prefix and not entry.name.startswith(f"{prefix}-"):
+                continue
+            sentinel = entry / ".last-success"
+            if not sentinel.exists():
+                continue
+            try:
+                m = sentinel.stat().st_mtime
+                if m > latest:
+                    latest = m
+            except OSError:
+                continue
     except OSError:
         return None
     return latest if latest > 0 else None

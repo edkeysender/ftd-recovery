@@ -86,6 +86,9 @@ kill "$REPORTER_PID" 2>/dev/null
 wait "$REPORTER_PID" 2>/dev/null
 
 if [ "$RC" = "0" ]; then
+    # Write a success sentinel the FastAPI UI uses to distinguish
+    # "recent activity in this dir" (mtime) from "last successful backup".
+    date -u '+%Y-%m-%dT%H:%M:%SZ' > "/home/partimag/${IMG}/.last-success" 2>/dev/null || true
     post_progress '{"phase":"completed","status":"completed","percent":100}'
 else
     post_progress "{\"phase\":\"failed\",\"status\":\"failed\",\"rc\":$RC}"
