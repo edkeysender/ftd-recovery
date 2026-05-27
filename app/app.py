@@ -133,6 +133,11 @@ app = FastAPI(title="Recovery Status")
 
 _hostname_cache: dict[str, tuple[float, Optional[str]]] = {}
 
+# Concurrency locks — one per mutable file.
+# Always acquire _hosts_lock BEFORE _state_lock when both are needed.
+_hosts_lock = asyncio.Lock()
+_state_lock = asyncio.Lock()
+
 
 # ---------- hosts.yml ----------
 
@@ -144,7 +149,9 @@ def load_hosts() -> list[dict]:
 
 
 def save_hosts(hosts: list[dict]) -> None:
-    HOSTS_FILE.write_text(yaml.safe_dump({"hosts": hosts}, sort_keys=False))
+    tmp = HOSTS_FILE.with_suffix(".tmp")
+    tmp.write_text(yaml.safe_dump({"hosts": hosts}, sort_keys=False))
+    tmp.replace(HOSTS_FILE)
 
 
 # DHCP hostname cache written by recovery-dhcp-sniffer.service
@@ -795,15 +802,22 @@ async def get_drive_health() -> dict:
 
 @app.get("/api/status")
 async def api_status():
-    hosts = load_hosts()
+    # Narrow lock scope: load hosts into a local snapshot, release the lock,
+    # then do the network I/O (pings can take ~1s each), then re-acquire
+    # _state_lock for the prune+save cycle.  Holding _hosts_lock across all
+    # concurrent pings would stall every write operation for up to N*PING_TIMEOUT
+    # seconds on every 5-second poll.
+    async with _hosts_lock:
+        hosts = load_hosts()
     ping_r, hn_r, arp_r = await asyncio.gather(
         asyncio.gather(*(ping_host(h["host"]) for h in hosts), return_exceptions=True),
         asyncio.gather(*(resolve_hostname(h["host"]) for h in hosts), return_exceptions=True),
         asyncio.gather(*(arp_lookup(h["host"]) for h in hosts), return_exceptions=True),
     )
-    state = load_state()
-    state, _ = await prune_expired(state)
-    save_state(state)
+    async with _state_lock:
+        state = load_state()
+        state, _ = await prune_expired(state)
+        save_state(state)
     out = []
     for h, p, hn, arp in zip(hosts, ping_r, hn_r, arp_r):
         online, latency = (False, None)
@@ -986,12 +1000,13 @@ class NameUpdate(BaseModel):
 
 @app.put("/api/host/{ip}/name")
 async def update_name(ip: str, payload: NameUpdate):
-    hosts = load_hosts()
-    for h in hosts:
-        if h.get("host") == ip:
-            h["name"] = payload.name.strip() or h["host"]
-            save_hosts(hosts)
-            return {"ok": True, "name": h["name"]}
+    async with _hosts_lock:
+        hosts = load_hosts()
+        for h in hosts:
+            if h.get("host") == ip:
+                h["name"] = payload.name.strip() or h["host"]
+                save_hosts(hosts)
+                return {"ok": True, "name": h["name"]}
     raise HTTPException(status_code=404, detail="host not found")
 
 
@@ -1014,64 +1029,66 @@ async def add_hosts(payload: HostBatchAdd):
     """
     if not payload.hosts:
         return {"ok": True, "added": [], "skipped": []}
-    hosts = load_hosts()
-    known_ips = {h.get("host") for h in hosts}
-    known_macs = set()
-    for h in hosts:
-        if h.get("mac"):
-            try:
-                known_macs.add(normalize_mac(h["mac"]))
-            except ValueError:
-                pass
     dhcp_names = load_dhcp_names()
-    added: list[dict] = []
-    skipped: list[dict] = []
-    for entry in payload.hosts:
-        try:
-            mac_n = normalize_mac(entry.mac)
-        except ValueError:
-            skipped.append({"host": entry.host, "mac": entry.mac, "reason": "invalid MAC"})
-            continue
-        if entry.host in known_ips or mac_n in known_macs:
-            skipped.append({"host": entry.host, "mac": mac_n, "reason": "already in list"})
-            continue
-        name = _safe_name((entry.name or "").strip() or suggested_name(mac_n, dhcp_names)) or "Unknown"
-        new = {"name": name, "host": entry.host, "mac": mac_n}
-        hosts.append(new)
-        added.append(new)
-        known_ips.add(entry.host)
-        known_macs.add(mac_n)
-    if added:
-        save_hosts(hosts)
+    async with _hosts_lock:
+        hosts = load_hosts()
+        known_ips = {h.get("host") for h in hosts}
+        known_macs = set()
+        for h in hosts:
+            if h.get("mac"):
+                try:
+                    known_macs.add(normalize_mac(h["mac"]))
+                except ValueError:
+                    pass
+        added: list[dict] = []
+        skipped: list[dict] = []
+        for entry in payload.hosts:
+            try:
+                mac_n = normalize_mac(entry.mac)
+            except ValueError:
+                skipped.append({"host": entry.host, "mac": entry.mac, "reason": "invalid MAC"})
+                continue
+            if entry.host in known_ips or mac_n in known_macs:
+                skipped.append({"host": entry.host, "mac": mac_n, "reason": "already in list"})
+                continue
+            name = _safe_name((entry.name or "").strip() or suggested_name(mac_n, dhcp_names)) or "Unknown"
+            new = {"name": name, "host": entry.host, "mac": mac_n}
+            hosts.append(new)
+            added.append(new)
+            known_ips.add(entry.host)
+            known_macs.add(mac_n)
+        if added:
+            save_hosts(hosts)
     return {"ok": True, "added": added, "skipped": skipped}
 
 
 @app.delete("/api/host/{ip}")
 async def remove_host(ip: str):
     """Remove a host from the backup list. Disarms it first if armed."""
-    hosts = load_hosts()
-    target = next((h for h in hosts if h.get("host") == ip), None)
-    if not target:
-        raise HTTPException(status_code=404, detail="host not found")
-    mac_n: Optional[str] = None
-    if target.get("mac"):
-        try:
-            mac_n = normalize_mac(target["mac"])
-        except ValueError:
-            mac_n = None
-    if mac_n:
-        state = load_state()
-        state, _ = await prune_expired(state)
-        if mac_n in state["armed"]:
-            del state["armed"][mac_n]
+    async with _hosts_lock, _state_lock:
+        hosts = load_hosts()
+        target = next((h for h in hosts if h.get("host") == ip), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="host not found")
+        mac_n: Optional[str] = None
+        if target.get("mac"):
             try:
-                await run_allowlist("remove", mac_n)
-            except subprocess.CalledProcessError as exc:
-                print(f"[remove_host] allowlist remove failed for {mac_n}: {_err_text(exc)}")
-            await remove_grub_armed(mac_n)
-            save_state(state)
-    hosts = [h for h in hosts if h.get("host") != ip]
-    save_hosts(hosts)
+                mac_n = normalize_mac(target["mac"])
+            except ValueError:
+                mac_n = None
+        if mac_n:
+            state = load_state()
+            state, _ = await prune_expired(state)
+            if mac_n in state["armed"]:
+                del state["armed"][mac_n]
+                try:
+                    await run_allowlist("remove", mac_n)
+                except subprocess.CalledProcessError as exc:
+                    print(f"[remove_host] allowlist remove failed for {mac_n}: {_err_text(exc)}")
+                await remove_grub_armed(mac_n)
+                save_state(state)
+        hosts = [h for h in hosts if h.get("host") != ip]
+        save_hosts(hosts)
     return {"ok": True, "removed": {"host": ip, "mac": mac_n, "name": target.get("name")}}
 
 
@@ -1157,34 +1174,36 @@ async def _arm_one_mac(
 
 @app.post("/api/host/{ip}/mode")
 async def arm_host(ip: str, payload: ArmRequest):
-    hosts = load_hosts()
-    target = next((h for h in hosts if h.get("host") == ip), None)
-    if not target:
-        raise HTTPException(status_code=404, detail="host not found")
+    # ARP lookup is external I/O — do it before acquiring the lock.
     arp_mac = await arp_lookup(ip)
-    try:
-        mac = _resolve_mac_and_persist(target, hosts, arp_mac)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    if not mac:
-        raise HTTPException(status_code=400, detail="no MAC available — set it in hosts.yml or ping the host first")
-
-    state = load_state()
-    state, _ = await prune_expired(state)
-    save_state(state)  # persist any pruning side-effects
-
-    entry = await _arm_one_mac(state, mac, payload.mode, payload.image, payload.ttl_seconds, host_ip=ip)
-
-    try:
-        save_state(state)
-    except Exception as e:
-        # Roll back the real-world side effects so we don't leave armed-without-record.
+    async with _hosts_lock, _state_lock:
+        hosts = load_hosts()
+        target = next((h for h in hosts if h.get("host") == ip), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="host not found")
         try:
-            await run_allowlist("remove", mac)
-        except Exception:
-            pass
-        await remove_grub_armed(mac)
-        raise HTTPException(status_code=500, detail=f"state save failed: {e}")
+            mac = _resolve_mac_and_persist(target, hosts, arp_mac)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if not mac:
+            raise HTTPException(status_code=400, detail="no MAC available — set it in hosts.yml or ping the host first")
+
+        state = load_state()
+        state, _ = await prune_expired(state)
+        save_state(state)  # persist any pruning side-effects
+
+        entry = await _arm_one_mac(state, mac, payload.mode, payload.image, payload.ttl_seconds, host_ip=ip)
+
+        try:
+            save_state(state)
+        except Exception as e:
+            # Roll back the real-world side effects so we don't leave armed-without-record.
+            try:
+                await run_allowlist("remove", mac)
+            except Exception:
+                pass
+            await remove_grub_armed(mac)
+            raise HTTPException(status_code=500, detail=f"state save failed: {e}")
 
     print(f"[arm] {ip} ({mac}) -> {payload.mode} (image={payload.image or 'own'}), expires {entry['expires_at']}")
     return {"ok": True, "mac": mac, "mode": payload.mode, "image": payload.image, "expires_at": entry["expires_at"]}
@@ -1207,50 +1226,51 @@ async def arm_batch(req: ArmBatchRequest) -> ArmBatchResult:
     if req.mode == "recovery" and not req.image:
         raise HTTPException(status_code=400, detail="image required for recovery mode")
 
-    hosts = load_hosts()
-    mac_to_ip: dict[str, str] = {}
-    for h in hosts:
-        if h.get("mac") and h.get("host"):
+    async with _hosts_lock, _state_lock:
+        hosts = load_hosts()
+        mac_to_ip: dict[str, str] = {}
+        for h in hosts:
+            if h.get("mac") and h.get("host"):
+                try:
+                    mac_to_ip[normalize_mac(h["mac"])] = h["host"]
+                except ValueError:
+                    continue
+
+        state = load_state()
+        state, _ = await prune_expired(state)
+        save_state(state)
+
+        armed: list[str] = []
+        failed: dict[str, str] = {}
+
+        for raw_mac in req.macs:
             try:
-                mac_to_ip[normalize_mac(h["mac"])] = h["host"]
-            except ValueError:
+                mac = normalize_mac(raw_mac)
+            except ValueError as exc:
+                failed[raw_mac] = f"invalid mac: {exc}"
+                continue
+            try:
+                await _arm_one_mac(
+                    state, mac, req.mode, req.image, req.ttl_seconds,
+                    host_ip=mac_to_ip.get(mac),
+                )
+                armed.append(mac)
+            except HTTPException as exc:
+                # _arm_one_mac already rolled back step 1 if step 2 failed.
+                failed[mac] = str(exc.detail)
                 continue
 
-    state = load_state()
-    state, _ = await prune_expired(state)
-    save_state(state)
-
-    armed: list[str] = []
-    failed: dict[str, str] = {}
-
-    for raw_mac in req.macs:
         try:
-            mac = normalize_mac(raw_mac)
-        except ValueError as exc:
-            failed[raw_mac] = f"invalid mac: {exc}"
-            continue
-        try:
-            await _arm_one_mac(
-                state, mac, req.mode, req.image, req.ttl_seconds,
-                host_ip=mac_to_ip.get(mac),
-            )
-            armed.append(mac)
-        except HTTPException as exc:
-            # _arm_one_mac already rolled back step 1 if step 2 failed.
-            failed[mac] = str(exc.detail)
-            continue
-
-    try:
-        save_state(state)
-    except Exception as exc:
-        # State save failure after partial arm: roll back EVERY mac we just armed.
-        for mac in armed:
-            try:
-                await run_allowlist("remove", mac)
-            except Exception:
-                pass
-            await remove_grub_armed(mac)
-        raise HTTPException(status_code=500, detail=f"state save failed: {exc}")
+            save_state(state)
+        except Exception as exc:
+            # State save failure after partial arm: roll back EVERY mac we just armed.
+            for mac in armed:
+                try:
+                    await run_allowlist("remove", mac)
+                except Exception:
+                    pass
+                await remove_grub_armed(mac)
+            raise HTTPException(status_code=500, detail=f"state save failed: {exc}")
 
     print(f"[arm-batch] {req.mode} ttl={req.ttl_seconds}s armed={len(armed)} failed={len(failed)}")
     return ArmBatchResult(armed=armed, failed=failed)
@@ -1258,17 +1278,18 @@ async def arm_batch(req: ArmBatchRequest) -> ArmBatchResult:
 
 @app.delete("/api/host/{ip}/mode")
 async def disarm_host(ip: str):
-    state = load_state()
-    state, _ = await prune_expired(state)
-    macs = [m for m, e in state["armed"].items() if e.get("host_ip") == ip]
-    for m in macs:
-        del state["armed"][m]
-        try:
-            await run_allowlist("remove", m)
-        except subprocess.CalledProcessError as e:
-            print(f"[disarm] allowlist remove failed for {m}: {_err_text(e)}")
-        await remove_grub_armed(m)
-    save_state(state)
+    async with _state_lock:
+        state = load_state()
+        state, _ = await prune_expired(state)
+        macs = [m for m, e in state["armed"].items() if e.get("host_ip") == ip]
+        for m in macs:
+            del state["armed"][m]
+            try:
+                await run_allowlist("remove", m)
+            except subprocess.CalledProcessError as e:
+                print(f"[disarm] allowlist remove failed for {m}: {_err_text(e)}")
+            await remove_grub_armed(m)
+        save_state(state)
     print(f"[disarm] {ip} -> cleared {macs}")
     return {"ok": True, "disarmed_macs": macs}
 
@@ -1280,18 +1301,19 @@ async def disarm_mac(mac: str):
         mac_n = normalize_mac(mac)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    state = load_state()
-    state, _ = await prune_expired(state)
-    cleared = False
-    if mac_n in state["armed"]:
-        del state["armed"][mac_n]
-        cleared = True
-        try:
-            await run_allowlist("remove", mac_n)
-        except subprocess.CalledProcessError as e:
-            print(f"[disarm-mac] allowlist remove failed for {mac_n}: {_err_text(e)}")
-    await remove_grub_armed(mac_n)
-    save_state(state)
+    async with _state_lock:
+        state = load_state()
+        state, _ = await prune_expired(state)
+        cleared = False
+        if mac_n in state["armed"]:
+            del state["armed"][mac_n]
+            cleared = True
+            try:
+                await run_allowlist("remove", mac_n)
+            except subprocess.CalledProcessError as e:
+                print(f"[disarm-mac] allowlist remove failed for {mac_n}: {_err_text(e)}")
+        await remove_grub_armed(mac_n)
+        save_state(state)
     print(f"[disarm-mac] {mac_n} cleared={cleared}")
     return {"ok": True, "mac": mac_n, "cleared": cleared}
 
@@ -1479,6 +1501,8 @@ async def arp_scan_subnet() -> list[tuple[str, str]]:
 
 @app.post("/api/scan")
 async def api_scan():
+    # Phase 1: network I/O — arp-scan, routing, WSD probe — all OUTSIDE the lock.
+    # This can take 5-15 seconds; holding the lock here would freeze all writes.
     try:
         found, gateway, own_ips = await asyncio.gather(
             arp_scan_subnet(), get_gateway(), get_own_ips()
@@ -1486,66 +1510,12 @@ async def api_scan():
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    hosts = load_hosts()
-    known_macs = {normalize_mac(h["mac"]) for h in hosts if h.get("mac")}
-    known_ips = {h["host"] for h in hosts}
     skip_ips = own_ips | ({gateway} if gateway else set())
     dhcp_names = load_dhcp_names()
     # WS-Discovery: active probe to ask Windows hosts for their computer name.
     # Pick the non-loopback own IP so the multicast actually leaves the box.
     source_ip = next((i for i in own_ips if not i.startswith("127.")), None)
     wsd_names = await wsd_discover_names(source_ip) if source_ip else {}
-
-    added: list[dict] = []
-    renamed: list[dict] = []
-    replaced: list[dict] = []
-
-    # Detect MAC changes: same IP, different MAC = host was swapped.
-    by_ip = {h["host"]: h for h in hosts}
-    state = None
-    for ip, new_mac in found:
-        if ip in skip_ips:
-            continue
-        host = by_ip.get(ip)
-        if not host:
-            continue
-        old_mac_raw = host.get("mac")
-        if not old_mac_raw:
-            host["mac"] = new_mac
-            known_macs.add(new_mac)
-            continue
-        try:
-            old_mac_n = normalize_mac(old_mac_raw)
-        except ValueError:
-            old_mac_n = None
-        if old_mac_n == new_mac:
-            continue
-        new_name = _safe_name(dhcp_names.get(new_mac)) or f"Unknown-{new_mac.replace(':', '')[-4:]}"
-        replaced.append({
-            "host": ip,
-            "old_mac": old_mac_n or old_mac_raw,
-            "new_mac": new_mac,
-            "old_name": host.get("name"),
-            "new_name": new_name,
-        })
-        # Disarm the old MAC if armed.
-        if old_mac_n:
-            if state is None:
-                state = load_state()
-                state, _ = await prune_expired(state)
-            if old_mac_n in state["armed"]:
-                del state["armed"][old_mac_n]
-                try:
-                    await run_allowlist("remove", old_mac_n)
-                except subprocess.CalledProcessError as exc:
-                    print(f"[scan-replace] allowlist remove failed for {old_mac_n}: {_err_text(exc)}")
-                await remove_grub_armed(old_mac_n)
-            known_macs.discard(old_mac_n)
-        host["mac"] = new_mac
-        host["name"] = new_name
-        known_macs.add(new_mac)
-    if state is not None:
-        save_state(state)
 
     # Build {mac: name} from WSD by matching current arp-scan IPs.
     wsd_by_mac: dict[str, str] = {}
@@ -1554,77 +1524,135 @@ async def api_scan():
             if ip_ in wsd_names:
                 wsd_by_mac[mac_] = wsd_names[ip_]
 
-    # Upgrade auto-named hosts (Unknown-XXXX / Vendor-XXXX) when DHCP or WSD
-    # now knows the real hostname. DHCP cache wins over WSD if both have it.
-    for h in hosts:
-        mac = h.get("mac")
-        if not mac or not is_auto_name(h.get("name", "")):
-            continue
-        try:
-            mac_n = normalize_mac(mac)
-        except ValueError:
-            continue
-        real = _safe_name(dhcp_names.get(mac_n) or wsd_by_mac.get(mac_n))
-        if real and real != h["name"]:
-            renamed.append({"host": h["host"], "from": h["name"], "to": real})
-            h["name"] = real
-
-    discovered: list[dict] = []
-    for ip, mac in found:
-        if ip in skip_ips or ip in known_ips or mac in known_macs:
-            continue
-        discovered.append({
-            "name": _safe_name(suggested_name(mac, dhcp_names, wsd_names, ip)) or "Unknown",
-            "host": ip,
-            "mac": mac,
-            "category": classify_mac(mac),
-            "vendor": vendor_label(mac),
-        })
-
-    # Deduplicate by MAC: same physical NIC, multiple stale IP entries.
-    # Priority: manual name beats auto-name; then online beats offline.
-    # Manual intent outranks current network state because PXE transients
-    # briefly assign machines to other IPs from the router's lease pool.
+    # Phase 2: load-mutate-save block — held under both locks for atomicity.
+    added: list[dict] = []
+    renamed: list[dict] = []
+    replaced: list[dict] = []
     removed: list[dict] = []
-    online_ips = {ip for ip, _ in found}
-    by_mac: dict[str, list[dict]] = {}
-    for h in hosts:
-        m = h.get("mac")
-        if not m:
-            continue
-        try:
-            by_mac.setdefault(normalize_mac(m), []).append(h)
-        except ValueError:
-            continue
-    drop_ids: set[int] = set()
-    for mac_n, entries in by_mac.items():
-        if len(entries) < 2:
-            continue
-        named = [h for h in entries if not is_auto_name(h.get("name", ""))]
-        winner = None
-        reason = None
-        if len(named) == 1:
-            winner, reason = named[0], "duplicate MAC — other entry has a manual name"
-        elif len(named) == 0:
-            live = [h for h in entries if h["host"] in online_ips]
-            if len(live) == 1:
-                winner, reason = live[0], "duplicate MAC — other entry is currently online"
-        # If multiple have manual names, or none online and none manually named,
-        # the situation is ambiguous — leave both entries alone.
-        if not winner:
-            continue
-        for h in entries:
-            if h is winner:
-                continue
-            removed.append({"host": h["host"], "mac": mac_n,
-                            "name": h.get("name"), "kept_host": winner["host"],
-                            "reason": reason})
-            drop_ids.add(id(h))
-    if drop_ids:
-        hosts = [h for h in hosts if id(h) not in drop_ids]
+    discovered: list[dict] = []
 
-    if renamed or replaced or removed:
-        save_hosts(hosts)
+    async with _hosts_lock, _state_lock:
+        hosts = load_hosts()
+        known_macs = {normalize_mac(h["mac"]) for h in hosts if h.get("mac")}
+        known_ips = {h["host"] for h in hosts}
+
+        # Detect MAC changes: same IP, different MAC = host was swapped.
+        by_ip = {h["host"]: h for h in hosts}
+        state = None
+        for ip, new_mac in found:
+            if ip in skip_ips:
+                continue
+            host = by_ip.get(ip)
+            if not host:
+                continue
+            old_mac_raw = host.get("mac")
+            if not old_mac_raw:
+                host["mac"] = new_mac
+                known_macs.add(new_mac)
+                continue
+            try:
+                old_mac_n = normalize_mac(old_mac_raw)
+            except ValueError:
+                old_mac_n = None
+            if old_mac_n == new_mac:
+                continue
+            new_name = _safe_name(dhcp_names.get(new_mac)) or f"Unknown-{new_mac.replace(':', '')[-4:]}"
+            replaced.append({
+                "host": ip,
+                "old_mac": old_mac_n or old_mac_raw,
+                "new_mac": new_mac,
+                "old_name": host.get("name"),
+                "new_name": new_name,
+            })
+            # Disarm the old MAC if armed.
+            if old_mac_n:
+                if state is None:
+                    state = load_state()
+                    state, _ = await prune_expired(state)
+                if old_mac_n in state["armed"]:
+                    del state["armed"][old_mac_n]
+                    try:
+                        await run_allowlist("remove", old_mac_n)
+                    except subprocess.CalledProcessError as exc:
+                        print(f"[scan-replace] allowlist remove failed for {old_mac_n}: {_err_text(exc)}")
+                    await remove_grub_armed(old_mac_n)
+                known_macs.discard(old_mac_n)
+            host["mac"] = new_mac
+            host["name"] = new_name
+            known_macs.add(new_mac)
+        if state is not None:
+            save_state(state)
+
+        # Upgrade auto-named hosts (Unknown-XXXX / Vendor-XXXX) when DHCP or WSD
+        # now knows the real hostname. DHCP cache wins over WSD if both have it.
+        for h in hosts:
+            mac = h.get("mac")
+            if not mac or not is_auto_name(h.get("name", "")):
+                continue
+            try:
+                mac_n = normalize_mac(mac)
+            except ValueError:
+                continue
+            real = _safe_name(dhcp_names.get(mac_n) or wsd_by_mac.get(mac_n))
+            if real and real != h["name"]:
+                renamed.append({"host": h["host"], "from": h["name"], "to": real})
+                h["name"] = real
+
+        for ip, mac in found:
+            if ip in skip_ips or ip in known_ips or mac in known_macs:
+                continue
+            discovered.append({
+                "name": _safe_name(suggested_name(mac, dhcp_names, wsd_names, ip)) or "Unknown",
+                "host": ip,
+                "mac": mac,
+                "category": classify_mac(mac),
+                "vendor": vendor_label(mac),
+            })
+
+        # Deduplicate by MAC: same physical NIC, multiple stale IP entries.
+        # Priority: manual name beats auto-name; then online beats offline.
+        # Manual intent outranks current network state because PXE transients
+        # briefly assign machines to other IPs from the router's lease pool.
+        online_ips = {ip for ip, _ in found}
+        by_mac: dict[str, list[dict]] = {}
+        for h in hosts:
+            m = h.get("mac")
+            if not m:
+                continue
+            try:
+                by_mac.setdefault(normalize_mac(m), []).append(h)
+            except ValueError:
+                continue
+        drop_ids: set[int] = set()
+        for mac_n, entries in by_mac.items():
+            if len(entries) < 2:
+                continue
+            named = [h for h in entries if not is_auto_name(h.get("name", ""))]
+            winner = None
+            reason = None
+            if len(named) == 1:
+                winner, reason = named[0], "duplicate MAC — other entry has a manual name"
+            elif len(named) == 0:
+                live = [h for h in entries if h["host"] in online_ips]
+                if len(live) == 1:
+                    winner, reason = live[0], "duplicate MAC — other entry is currently online"
+            # If multiple have manual names, or none online and none manually named,
+            # the situation is ambiguous — leave both entries alone.
+            if not winner:
+                continue
+            for h in entries:
+                if h is winner:
+                    continue
+                removed.append({"host": h["host"], "mac": mac_n,
+                                "name": h.get("name"), "kept_host": winner["host"],
+                                "reason": reason})
+                drop_ids.add(id(h))
+        if drop_ids:
+            hosts = [h for h in hosts if id(h) not in drop_ids]
+
+        if renamed or replaced or removed:
+            save_hosts(hosts)
+
     return {"ok": True, "added": added, "renamed": renamed,
             "replaced": replaced, "removed": removed,
             "discovered": discovered, "scanned": len(found)}
@@ -1639,18 +1667,20 @@ async def ipxe_boot(mac: str = ""):
     except ValueError:
         return PlainTextResponse(IPXE_LOCAL, media_type="text/plain")
 
-    state = load_state()
-    state, _ = await prune_expired(state)
-    entry = state["armed"].get(mac_n)
-    if not entry:
-        save_state(state)
-        print(f"[ipxe] {mac_n}: not armed -> boot local")
-        return PlainTextResponse(IPXE_LOCAL, media_type="text/plain")
+    mode = None
+    async with _state_lock:
+        state = load_state()
+        state, _ = await prune_expired(state)
+        entry = state["armed"].get(mac_n)
+        if not entry:
+            save_state(state)
+            print(f"[ipxe] {mac_n}: not armed -> boot local")
+            return PlainTextResponse(IPXE_LOCAL, media_type="text/plain")
 
-    mode = entry["mode"]
-    # Consume: remove from state and allowlist (one-shot)
-    del state["armed"][mac_n]
-    save_state(state)
+        mode = entry["mode"]
+        # Consume: remove from state (one-shot) — allowlist cleanup happens after releasing the lock.
+        del state["armed"][mac_n]
+        save_state(state)
     try:
         await run_allowlist("remove", mac_n)
     except subprocess.CalledProcessError as e:
