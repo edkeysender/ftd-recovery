@@ -605,6 +605,117 @@ def check_storage() -> dict:
     }
 
 
+# ---------- Drive health ----------
+
+_drive_health_cache: dict = {}
+_DRIVE_HEALTH_TTL = 60  # seconds
+
+
+def _backup_device() -> Optional[str]:
+    """Return the block disk device (e.g. /dev/sda, /dev/nvme1n1) backing the backup storage."""
+    try:
+        bind_src = subprocess.check_output(
+            ["awk", '$2 == "/srv/clonezilla-images" && $1 !~ /^#/ {print $1; exit}', "/etc/fstab"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        if not bind_src:
+            return None
+        underlying = str(Path(bind_src).parent)
+        partition = subprocess.check_output(
+            ["findmnt", "-no", "SOURCE", underlying],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        if not partition.startswith("/dev/"):
+            return None
+        pkname = subprocess.check_output(
+            ["lsblk", "-no", "PKNAME", partition],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+        return f"/dev/{pkname}" if pkname else partition
+    except Exception:
+        return None
+
+
+def get_drive_health() -> dict:
+    now = time.time()
+    cached = _drive_health_cache.get("result")
+    if cached and now - _drive_health_cache.get("at", 0) < _DRIVE_HEALTH_TTL:
+        return cached
+
+    device = _backup_device()
+    if not device:
+        result: dict = {"ok": False, "error": "could not determine backup drive device"}
+        _drive_health_cache.update({"result": result, "at": now})
+        return result
+
+    try:
+        proc = subprocess.run(
+            ["sudo", "/usr/sbin/smartctl", "-j", "-H", "-A", "-i", device],
+            capture_output=True, text=True, timeout=15,
+        )
+        data = json.loads(proc.stdout)
+    except FileNotFoundError:
+        result = {"ok": False, "device": device,
+                  "error": "smartctl not installed — run: sudo apt install smartmontools"}
+        _drive_health_cache.update({"result": result, "at": now})
+        return result
+    except Exception as e:
+        result = {"ok": False, "device": device, "error": str(e)}
+        _drive_health_cache.update({"result": result, "at": now})
+        return result
+
+    passed = data.get("smart_status", {}).get("passed")
+    health = "PASSED" if passed is True else ("FAILED" if passed is False else "UNKNOWN")
+
+    capacity_bytes = data.get("user_capacity", {}).get("bytes", 0)
+    result = {
+        "ok": True,
+        "device": device,
+        "health": health,
+        "temperature_c": data.get("temperature", {}).get("current"),
+        "power_on_hours": data.get("power_on_time", {}).get("hours"),
+        "model": data.get("model_name") or data.get("model_family"),
+        "serial": data.get("serial_number"),
+        "firmware": data.get("firmware_version"),
+        "capacity_gb": round(capacity_bytes / 1024**3, 1) if capacity_bytes else None,
+    }
+
+    smartctl_errors = [
+        m.get("string", "")
+        for m in data.get("smartctl", {}).get("messages", [])
+        if m.get("severity") == "error"
+    ]
+    if smartctl_errors:
+        result["warnings"] = smartctl_errors
+
+    nvme_log = data.get("nvme_smart_health_information_log")
+    if nvme_log:
+        result["type"] = "nvme"
+        result["nvme"] = {
+            "available_spare_pct": nvme_log.get("available_spare"),
+            "available_spare_threshold_pct": nvme_log.get("available_spare_threshold"),
+            "percentage_used": nvme_log.get("percentage_used"),
+            "critical_warning": nvme_log.get("critical_warning"),
+            "data_read_gb": round(nvme_log.get("data_units_read", 0) * 512000 / 1024**3, 1),
+            "data_written_gb": round(nvme_log.get("data_units_written", 0) * 512000 / 1024**3, 1),
+        }
+    else:
+        attrs = {
+            a["id"]: a["raw"]["value"]
+            for a in data.get("ata_smart_attributes", {}).get("table", [])
+            if "id" in a and "raw" in a and "value" in a["raw"]
+        }
+        result["type"] = "sata" if attrs else "unknown"
+        result["ata"] = {
+            "reallocated_sectors": attrs.get(5),
+            "pending_sectors": attrs.get(197),
+            "uncorrectable_sectors": attrs.get(198),
+        }
+
+    _drive_health_cache.update({"result": result, "at": now})
+    return result
+
+
 # ---------- API ----------
 
 @app.get("/api/status")
@@ -645,6 +756,12 @@ async def api_status():
         })
     return {"checked_at": time.time(), "now": time.time(), "hosts": out,
             "storage": check_storage()}
+
+
+@app.get("/api/drive-health")
+async def api_drive_health():
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, get_drive_health)
 
 
 _IMG_RE = re.compile(r"^img-([0-9a-f]{2}(?:-[0-9a-f]{2}){5})(?:-(\d{8}-\d{4}))?$")

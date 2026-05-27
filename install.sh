@@ -71,7 +71,7 @@ export DEBIAN_FRONTEND=noninteractive
     dnsmasq tftpd-hpa arp-scan nfs-kernel-server \
     parted e2fsprogs \
     curl wget ca-certificates \
-    isc-dhcp-common \
+    isc-dhcp-common smartmontools \
     >/dev/null ) &
 _spin $!
 wait $!
