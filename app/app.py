@@ -14,6 +14,8 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).parent
+PROGRESS_DIR = APP_DIR / "progress"
+PROGRESS_DIR.mkdir(exist_ok=True)
 HOSTS_FILE = APP_DIR / "hosts.yml"
 STATE_FILE = APP_DIR / "state.json"
 DHCP_NAMES_FILE = APP_DIR / "dhcp_names.json"
@@ -821,6 +823,7 @@ async def api_status():
         state = load_state()
         state, _ = await prune_expired(state)
         save_state(state)
+    prune_old_progress()
     out = []
     for h, p, hn, arp in zip(hosts, ping_r, hn_r, arp_r):
         online, latency = (False, None)
@@ -861,7 +864,51 @@ _IMG_RE = re.compile(r"^img-([0-9a-f]{2}(?:-[0-9a-f]{2}){5})(?:-(\d{8}-\d{4}))?$
 # Live progress reports pushed by the recovery env's ocs-*.sh wrapper.
 # Cleared after PROGRESS_TTL seconds of inactivity so stale "running"
 # entries don't survive a hung script.
-_progress: dict[str, dict] = {}  # mac -> {phase, percent, elapsed, eta, rate, status, rc, updated_at}
+def _progress_path(mac_n: str) -> Path:
+    return PROGRESS_DIR / f"{mac_n}.json"
+
+
+def write_progress(mac_n: str, payload: dict) -> None:
+    """Merge payload into the existing on-disk progress entry and persist atomically."""
+    path = _progress_path(mac_n)
+    entry: dict = {}
+    if path.exists():
+        try:
+            entry = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            entry = {}
+    entry.update(payload)
+    entry["updated_at"] = time.time()
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(entry))
+    tmp.replace(path)
+
+
+def read_progress(mac_n: str) -> Optional[dict]:
+    path = _progress_path(mac_n)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def delete_progress_file(mac_n: str) -> None:
+    _progress_path(mac_n).unlink(missing_ok=True)
+
+
+def prune_old_progress(now: Optional[float] = None) -> None:
+    """Remove on-disk progress files older than PROGRESS_TTL."""
+    now = now if now is not None else time.time()
+    for p in PROGRESS_DIR.glob("*.json"):
+        try:
+            data = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            p.unlink(missing_ok=True)
+            continue
+        if now - data.get("updated_at", 0) > PROGRESS_TTL:
+            p.unlink(missing_ok=True)
 
 
 class ProgressUpdate(BaseModel):
@@ -880,11 +927,7 @@ async def post_progress(mac: str, payload: ProgressUpdate):
         mac_n = normalize_mac(mac)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    entry = _progress.get(mac_n, {}).copy()
-    for k, v in payload.dict(exclude_none=True).items():
-        entry[k] = v
-    entry["updated_at"] = time.time()
-    _progress[mac_n] = entry
+    write_progress(mac_n, payload.dict(exclude_none=True))
     return {"ok": True}
 
 
@@ -894,14 +937,14 @@ async def delete_progress(mac: str):
         mac_n = normalize_mac(mac)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    _progress.pop(mac_n, None)
+    delete_progress_file(mac_n)
     return {"ok": True}
 
 
 def get_progress(mac: Optional[str]) -> Optional[dict]:
     if not mac:
         return None
-    entry = _progress.get(mac)
+    entry = read_progress(mac)
     if not entry:
         return None
     if time.time() - entry.get("updated_at", 0) > PROGRESS_TTL:
