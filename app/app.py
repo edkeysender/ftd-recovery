@@ -1816,6 +1816,9 @@ async function openRestorePicker(host, btn) {
   list.innerHTML = '<li class="muted">Loading…</li>';
   modal.classList.add('show');
   confirm.disabled = true;
+  const close = () => modal.classList.remove('show');
+  cancel.onclick = close;
+  modal.onclick = e => { if (e.target === modal) close(); };
   let selected = null;
   try {
     const r = await fetch('/api/images', { cache: 'no-store' });
@@ -1861,8 +1864,6 @@ async function openRestorePicker(host, btn) {
   } catch (e) {
     list.innerHTML = '<li class="muted">Error loading images: ' + e.message + '</li>';
   }
-  const close = () => modal.classList.remove('show');
-  cancel.onclick = close;
   confirm.onclick = () => {
     if (!selected) return;
     const hostLabel = host.name || host.host;
@@ -2077,6 +2078,9 @@ async function openAddDevicesPicker(btn) {
   list.innerHTML = '<li class="muted">Please wait — running arp-scan on the subnet…</li>';
   confirm.disabled = true;
   modal.classList.add('show');
+  const close = () => modal.classList.remove('show');
+  cancel.onclick = close;
+  modal.onclick = e => { if (e.target === modal) close(); };
   btn.disabled = true;
   let discovered = [];
   let warnings = null;
@@ -2171,8 +2175,6 @@ async function openAddDevicesPicker(btn) {
     warn.innerHTML = parts.join('<br>');
     warn.querySelector('.banner-dismiss').addEventListener('click', () => { warn.className = 'banner'; });
   }
-  const close = () => modal.classList.remove('show');
-  cancel.onclick = close;
   confirm.onclick = async () => {
     const picks = [];
     list.querySelectorAll('.addDevices-row').forEach(row => {
