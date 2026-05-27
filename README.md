@@ -66,6 +66,18 @@ unmounted and its fstab entries are removed; any existing backup images on it
 are left untouched. The `recovery-interface` service is restarted automatically
 once the new drive is configured.
 
+## Updating an existing installation
+
+Run on each Pi to pull the latest app, helpers, and sudoers from the repo:
+
+```bash
+curl -fsSL https://github.com/edkeysender/ftd-recovery/raw/main/update.sh | sudo bash
+```
+
+The updater auto-detects the install prefix from the running service, installs
+any newly required system packages, and restarts `recovery-interface`. It never
+touches `hosts.yml`, `state.json`, fstab entries, network config, or backup data.
+
 ## Verifying the install
 
 ```bash
