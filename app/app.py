@@ -636,41 +636,37 @@ def _backup_device() -> Optional[str]:
         return None
 
 
-def get_drive_health() -> dict:
-    now = time.time()
-    cached = _drive_health_cache.get("result")
-    if cached and now - _drive_health_cache.get("at", 0) < _DRIVE_HEALTH_TTL:
-        return cached
-
-    device = _backup_device()
-    if not device:
-        result: dict = {"ok": False, "error": "could not determine backup drive device"}
-        _drive_health_cache.update({"result": result, "at": now})
-        return result
-
+def _run_smartctl(device: str, extra_flags: list[str] | None = None) -> Optional[dict]:
+    flags = extra_flags or []
     try:
         proc = subprocess.run(
-            ["sudo", "/usr/sbin/smartctl", "-j", "-H", "-A", "-i", device],
+            ["sudo", "/usr/sbin/smartctl", "-j", "-H", "-A", "-i"] + flags + [device],
             capture_output=True, text=True, timeout=15,
         )
-        data = json.loads(proc.stdout)
-    except FileNotFoundError:
-        result = {"ok": False, "device": device,
-                  "error": "smartctl not installed — run: sudo apt install smartmontools"}
-        _drive_health_cache.update({"result": result, "at": now})
-        return result
-    except Exception as e:
-        result = {"ok": False, "device": device, "error": str(e)}
-        _drive_health_cache.update({"result": result, "at": now})
-        return result
+        return json.loads(proc.stdout)
+    except (FileNotFoundError, json.JSONDecodeError, subprocess.TimeoutExpired):
+        return None
 
+
+def _device_transport(device: str) -> str:
+    try:
+        return subprocess.check_output(
+            ["lsblk", "-no", "TRAN", device],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip().lower()
+    except Exception:
+        return ""
+
+
+def _parse_smartctl(data: dict, device: str, transport: str) -> dict:
     passed = data.get("smart_status", {}).get("passed")
     health = "PASSED" if passed is True else ("FAILED" if passed is False else "UNKNOWN")
-
     capacity_bytes = data.get("user_capacity", {}).get("bytes", 0)
-    result = {
+
+    result: dict = {
         "ok": True,
         "device": device,
+        "transport": transport or "unknown",
         "health": health,
         "temperature_c": data.get("temperature", {}).get("current"),
         "power_on_hours": data.get("power_on_time", {}).get("hours"),
@@ -711,6 +707,41 @@ def get_drive_health() -> dict:
             "pending_sectors": attrs.get(197),
             "uncorrectable_sectors": attrs.get(198),
         }
+
+    return result
+
+
+def get_drive_health() -> dict:
+    now = time.time()
+    cached = _drive_health_cache.get("result")
+    if cached and now - _drive_health_cache.get("at", 0) < _DRIVE_HEALTH_TTL:
+        return cached
+
+    device = _backup_device()
+    if not device:
+        result: dict = {"ok": False, "error": "could not determine backup drive device"}
+        _drive_health_cache.update({"result": result, "at": now})
+        return result
+
+    transport = _device_transport(device)
+
+    data = _run_smartctl(device)
+    if data is None:
+        result = {"ok": False, "device": device,
+                  "error": "smartctl not installed — run: sudo apt install smartmontools"}
+        _drive_health_cache.update({"result": result, "at": now})
+        return result
+
+    result = _parse_smartctl(data, device, transport)
+
+    # USB bridge blocked passthrough — retry with SAT (works on many bridges)
+    if transport == "usb" and result.get("health") == "UNKNOWN":
+        sat_data = _run_smartctl(device, ["-d", "sat"])
+        if sat_data:
+            sat_result = _parse_smartctl(sat_data, device, transport)
+            if sat_result.get("health") != "UNKNOWN" or sat_result.get("temperature_c") is not None:
+                sat_result["sat_passthrough"] = True
+                result = sat_result
 
     _drive_health_cache.update({"result": result, "at": now})
     return result
