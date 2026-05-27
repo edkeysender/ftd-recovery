@@ -4,7 +4,7 @@
 #
 # Tears down the current storage mount, runs the interactive storage
 # picker (same as the installer), updates fstab, and restarts the app.
-# Existing backup images on the old drive are left untouched.
+# Optionally copies existing backup images from the old drive to the new one.
 
 set -euo pipefail
 
@@ -45,6 +45,15 @@ if ! confirm "Continue?" "n"; then
     echo "Aborted."; exit 0
 fi
 
+# ── Capture old device before teardown ──────────────────────────────────────
+# If the underlying path is a mounted block device, save it so we can offer
+# to remount it later and copy images across.
+old_bind_src="$bind_src"
+old_device=""
+if [[ -n "$underlying" ]] && mountpoint -q "$underlying" 2>/dev/null; then
+    old_device=$(findmnt -no SOURCE "$underlying" 2>/dev/null || true)
+fi
+
 # ── Step 1: tear down current storage ───────────────────────────────────────
 log "removing current storage configuration"
 
@@ -76,3 +85,80 @@ ok "recovery-interface restarted"
 echo
 echo "${BOLD}${GREEN}Storage changed.${RESET} New path: $STORAGE_UNDERLYING"
 echo "Existing images on the old drive were not touched."
+
+# ── Step 4: offer to copy backups from old storage ───────────────────────────
+_copy_old_backups() {
+    local src_images=$1  # directory containing the image folders to copy from
+
+    if [[ ! -d "$src_images" ]]; then
+        return
+    fi
+
+    local -a images=()
+    mapfile -t images < <(find "$src_images" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
+
+    if [[ ${#images[@]} -eq 0 ]]; then
+        log "no backup images found on old drive"
+        return
+    fi
+
+    echo
+    echo "${BOLD}Backup images on old drive:${RESET}"
+    local i sz
+    for i in "${!images[@]}"; do
+        sz=$(du -sh "$src_images/${images[$i]}" 2>/dev/null | cut -f1 || echo "?")
+        printf "  %s%d)%s %-40s  %s\n" "$BOLD" "$((i+1))" "$RESET" "${images[$i]}" "$sz"
+    done
+    printf "  %sa)%s Copy all\n" "$BOLD" "$RESET"
+    echo
+
+    local reply
+    read -r -p "${BOLD}Copy which images to new drive? (number, 'a' for all, Enter to skip):${RESET} " reply </dev/tty
+
+    if [[ -z "$reply" ]]; then
+        log "skipping copy"
+        return
+    fi
+
+    local -a to_copy=()
+    if [[ "$reply" =~ ^[Aa]$ ]]; then
+        to_copy=("${images[@]}")
+    elif [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#images[@]} )); then
+        to_copy=("${images[$((reply-1))]}")
+    else
+        warn "invalid selection; skipping copy"
+        return
+    fi
+
+    local dst="/srv/clonezilla-images"
+    log "copying ${#to_copy[@]} image(s) to $dst ..."
+    local img
+    for img in "${to_copy[@]}"; do
+        log "copying $img ..."
+        rsync -a --info=progress2 "$src_images/$img" "$dst/"
+        ok "copied $img"
+    done
+}
+
+if [[ -n "$old_bind_src" ]]; then
+    echo
+    if [[ -n "$old_device" ]]; then
+        # Old storage was a mounted block device — remount temporarily.
+        tmp_mnt=$(mktemp -d /mnt/ftd-old-XXXXXX)
+        if mount "$old_device" "$tmp_mnt" 2>/dev/null; then
+            old_images_dir="$tmp_mnt/clonezilla-images"
+            if confirm "Copy existing backups from old drive to new one?" "n"; then
+                _copy_old_backups "$old_images_dir"
+            fi
+            umount "$tmp_mnt"
+        else
+            warn "could not remount old drive ($old_device); copy it manually if needed"
+        fi
+        rmdir "$tmp_mnt" 2>/dev/null || true
+    else
+        # Old storage was a local folder — still accessible.
+        if confirm "Copy existing backups from old location to new one?" "n"; then
+            _copy_old_backups "$old_bind_src"
+        fi
+    fi
+fi
