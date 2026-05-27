@@ -30,7 +30,7 @@ Override with `--prefix`, `--user`, `--interface`, `--server-ip`, `--subnet`.
 | TFTP + proxy-DHCP | dnsmasq | Hands PXE clients `grubnetx64.efi` |
 | Boot chain | `/srv/tftp/{grubnetx64.efi, debian-installer/amd64/grub/grub.cfg, clonezilla/*}` | GRUB → Clonezilla live |
 | NFS image store | `/srv/clonezilla-images` (bind) | Clients mount this to read/write images |
-| Helper scripts | `/usr/local/bin/recovery-{grubcfg,allowlist,rmimage}` | Privileged ops via sudo NOPASSWD |
+| Helper scripts | `/usr/local/bin/recovery-{grubcfg,allowlist,rmimage,remount,change-storage}` | Privileged ops via sudo NOPASSWD |
 | Sudoers | `/etc/sudoers.d/{ftd-grubcfg,ftd-rmimage,recovery-interface}` | Lets service user invoke helpers |
 
 ## Storage layout (chosen interactively at install)
@@ -49,6 +49,22 @@ In every case the installer ends by bind-mounting `<chosen>/clonezilla-images`
 to `/srv/clonezilla-images`, which is the canonical app-facing path. App,
 NFS export, and helper scripts all reference `/srv/clonezilla-images` only —
 the physical disk under it is swappable without touching them.
+
+## Administration commands
+
+### `recovery-change-storage`
+
+Switch the backup storage drive without reinstalling:
+
+```bash
+sudo recovery-change-storage
+```
+
+Shows the current drive's path and usage, asks for confirmation, then walks you
+through the same storage picker used by the installer. The old drive is
+unmounted and its fstab entries are removed; any existing backup images on it
+are left untouched. The `recovery-interface` service is restarted automatically
+once the new drive is configured.
 
 ## Verifying the install
 
