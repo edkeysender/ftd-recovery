@@ -57,8 +57,9 @@ fi
 # ── Step 1: tear down current storage ───────────────────────────────────────
 log "removing current storage configuration"
 
-# Stop the app so nothing holds the mount open.
+# Stop the app and unexport NFS so nothing holds the mount open.
 systemctl stop recovery-interface 2>/dev/null || true
+exportfs -u "*:/srv/clonezilla-images" 2>/dev/null || true
 
 # Unmount in order: bind first, then underlying device.
 if mountpoint -q "$STORAGE_BIND" 2>/dev/null; then
@@ -81,7 +82,8 @@ ok "old fstab entries removed"
 # ── Step 2: pick new storage ─────────────────────────────────────────────────
 choose_storage
 
-# ── Step 3: restart the app ──────────────────────────────────────────────────
+# ── Step 3: restart services ─────────────────────────────────────────────────
+exportfs -ra 2>/dev/null || true
 systemctl restart recovery-interface
 ok "recovery-interface restarted"
 
