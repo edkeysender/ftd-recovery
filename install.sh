@@ -146,6 +146,7 @@ mkdir -p "$INSTALL_PREFIX"
 # (and pip install) can write inside it.
 chown "$SERVICE_USER:$SERVICE_USER" "$INSTALL_PREFIX"
 install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SCRIPT_DIR/app/app.py"               "$INSTALL_PREFIX/app.py"
+install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SCRIPT_DIR/VERSION"                   "$INSTALL_PREFIX/VERSION"
 install -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SCRIPT_DIR/app/dhcp_namesniffer.py"  "$INSTALL_PREFIX/dhcp_namesniffer.py"
 install -m 0644 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SCRIPT_DIR/app/requirements.txt"     "$INSTALL_PREFIX/requirements.txt"
 if [[ ! -e "$INSTALL_PREFIX/hosts.yml" ]]; then

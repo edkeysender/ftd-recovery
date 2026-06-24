@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).parent
+VERSION = (APP_DIR / "VERSION").read_text().strip() if (APP_DIR / "VERSION").exists() else "unknown"
 HOSTS_FILE = APP_DIR / "hosts.yml"
 STATE_FILE = APP_DIR / "state.json"
 DHCP_NAMES_FILE = APP_DIR / "dhcp_names.json"
@@ -793,6 +794,11 @@ async def api_status():
 async def api_drive_health():
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, get_drive_health)
+
+
+@app.get("/api/version")
+async def api_version():
+    return {"version": VERSION}
 
 
 _IMG_RE = re.compile(r"^img-([0-9a-f]{2}(?:-[0-9a-f]{2}){5})(?:-(\d{8}-\d{4}))?$")

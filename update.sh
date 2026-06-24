@@ -85,6 +85,7 @@ ok "sudoers updated"
 # ── Step 5: app ──────────────────────────────────────────────────────────────
 log "updating app"
 install -m 0644 "$SCRIPT_DIR/app/app.py" "$INSTALL_PREFIX/app.py"
+install -m 0644 "$SCRIPT_DIR/VERSION"    "$INSTALL_PREFIX/VERSION"
 ok "app updated"
 
 # ── Step 6: restart services ─────────────────────────────────────────────────
