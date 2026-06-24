@@ -46,8 +46,10 @@ done
 systemctl daemon-reload
 
 log "removing helpers and sudoers"
-rm -f /usr/local/bin/recovery-grubcfg /usr/local/bin/recovery-allowlist /usr/local/bin/recovery-rmimage
+rm -f /usr/local/bin/recovery-grubcfg /usr/local/bin/recovery-allowlist /usr/local/bin/recovery-rmimage \
+      /usr/local/bin/recovery-remount /usr/local/bin/recovery-change-storage
 rm -f /etc/sudoers.d/ftd-grubcfg /etc/sudoers.d/ftd-rmimage /etc/sudoers.d/recovery-interface
+rm -rf /usr/local/lib/ftd-recovery
 
 log "removing dnsmasq + NFS config"
 rm -f /etc/dnsmasq.d/clonezilla-pxe.conf
