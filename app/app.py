@@ -1654,9 +1654,8 @@ INDEX_HTML = """<!doctype html>
 <body>
   <div class="header">
     <div>
-      <div class="brand">FTD Aero Recovery Center</div>
+      <div class="brand">FTD Aero Recovery Center <span id="versionTag" style="font-weight:400;opacity:0.5;font-size:0.75em"></span></div>
       <h1>Recovery Status</h1>
-      <div class="sub" id="versionTag"></div>
       <div class="sub" id="meta">Loading…</div>
     </div>
     <button class="scan" id="addDevicesBtn">+ Add backup devices</button>
