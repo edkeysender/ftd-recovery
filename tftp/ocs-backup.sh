@@ -53,6 +53,16 @@ post_progress() {
         --data "$1" >/dev/null 2>&1 || true
 }
 
+# Fail loudly if the NFS mount didn't happen; writing to local tmpfs would
+# silently fill the ramdisk and produce a misleading "no space" error.
+if ! mountpoint -q /home/partimag 2>/dev/null; then
+    echo "ERROR: /home/partimag is not mounted — NFS mount (ocs_prerun1) failed"
+    echo "Check that the NFS server is running and exporting /srv/clonezilla-images"
+    post_progress '{"phase":"failed","status":"failed","rc":98}'
+    sleep 15
+    reboot
+fi
+
 post_progress '{"phase":"backup","percent":0,"status":"started"}'
 
 # Background reporter: parse the latest "Completed: NN.NN%" line from

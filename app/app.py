@@ -1905,20 +1905,6 @@ function buildActionsCell(h, storageOk) {
   // user can immediately re-trigger or remove the host.
   const p = h.progress;
   const terminal = p && (p.status === 'completed' || p.status === 'failed');
-  if (p && !terminal) {
-    const pct = (p.percent != null) ? Math.max(0, Math.min(100, p.percent)) : 0;
-    const phase = (p.phase || 'running').toLowerCase();
-    const label = `${phase.toUpperCase()} ${pct.toFixed(1)}%`;
-    const metaParts = [];
-    if (p.eta)     metaParts.push('ETA ' + p.eta);
-    if (p.elapsed) metaParts.push('elapsed ' + p.elapsed);
-    if (p.rate)    metaParts.push(p.rate);
-    return `
-      <div class="progress ${phase}">
-        <div class="bar"><div class="fill" style="width:${pct}%"></div></div>
-        <div class="label">${label}${metaParts.length ? ' · ' + metaParts.join(' · ') : ''}</div>
-      </div>`;
-  }
   if (h.armed) {
     const m = h.armed.mode;
     const remaining = Math.max(0, h.armed.expires_at - serverNow);
