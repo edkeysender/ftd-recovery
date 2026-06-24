@@ -63,6 +63,13 @@ unmounted and its fstab entries are removed; any existing backup images on it
 are left untouched. The `recovery-interface` service is restarted automatically
 once the new drive is configured.
 
+## Checking the installed version
+
+```bash
+curl -s http://<server-ip>:8088/api/version
+# {"version":"1.0.0"}
+```
+
 ## Updating an existing installation
 
 Run on each Pi to pull the latest app, helpers, and sudoers from the repo:
