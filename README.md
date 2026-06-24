@@ -35,15 +35,12 @@ Override with `--prefix`, `--user`, `--interface`, `--server-ip`, `--subnet`.
 
 ## Storage layout (chosen interactively at install)
 
-The installer asks where backups should live and supports three modes:
+The installer asks where backups should live and supports two modes:
 
-1. **Use existing mount** — point at any writable path (e.g. `/mnt/backup`).
-   Non-destructive, no fstab change to the underlying device.
-2. **Adopt existing partition** — pick an already-formatted partition;
+1. **Adopt existing partition** — pick an already-formatted partition;
    installer reads its UUID, adds an fstab entry, mounts at `/mnt/ftd-backup`.
-3. **Format fresh disk** — pick a whole disk; installer requires typing its
-   serial number to confirm, then creates GPT + ext4 (label `ftd-backup`),
-   adds fstab UUID entry, mounts.
+2. **Format fresh disk** — pick a whole disk; requires typing `ERASE` to confirm,
+   then creates GPT + ext4 (label `ftd-backup`), adds fstab UUID entry, mounts.
 
 In every case the installer ends by bind-mounting `<chosen>/clonezilla-images`
 to `/srv/clonezilla-images`, which is the canonical app-facing path. App,

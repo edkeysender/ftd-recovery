@@ -388,18 +388,16 @@ choose_storage() {
 
     # ── Manual selection ─────────────────────────────────────────────────────
     echo "${BOLD}How should backups be stored?${RESET}"
-    echo "  1) Use a folder on this Pi (no extra drive needed)"
-    echo "  2) Use an existing external drive (already formatted)"
-    echo "  3) Erase and set up a blank drive (removes all data on that drive)"
+    echo "  1) Use an existing external drive (already formatted)"
+    echo "  2) Erase and set up a blank drive (removes all data on that drive)"
     echo
     local choice
     while true; do
-        choice=$(ask "Choose 1/2/3" "1")
+        choice=$(ask "Choose 1/2" "1")
         case "$choice" in
-            1) _mode1_existing_mount; break ;;
-            2) _mode2_adopt_partition; break ;;
-            3) _mode3_format_disk; break ;;
-            *) warn "enter 1, 2, or 3" ;;
+            1) _mode2_adopt_partition; break ;;
+            2) _mode3_format_disk; break ;;
+            *) warn "enter 1 or 2" ;;
         esac
     done
     _setup_bind_mount
