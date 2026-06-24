@@ -127,13 +127,30 @@ _mode2_adopt_partition() {
         mkdir -p "$mountpoint"
     fi
 
-    if ! grep -qE "^UUID=$uuid[[:space:]]" /etc/fstab; then
+    # Replace any existing fstab entry for this mountpoint (different device may be there).
+    local current_fstab_src
+    current_fstab_src=$(awk -v mp="$mountpoint" '$2 == mp && $1 !~ /^#/ {print $1; exit}' /etc/fstab || true)
+    if [[ "$current_fstab_src" == "UUID=$uuid" ]]; then
+        log "drive already registered in fstab"
+    else
+        sed -i "\|[[:space:]]${mountpoint}[[:space:]]|d" /etc/fstab
         echo "UUID=$uuid  $mountpoint  $fstype  defaults,noatime,nofail  0  2" >> /etc/fstab
         ok "drive registered in fstab"
-    else
-        log "drive already registered in fstab"
     fi
     systemctl daemon-reload || true
+
+    # If a different device occupies the mountpoint, unmount it first.
+    local cur_src
+    cur_src=$(findmnt -no SOURCE "$mountpoint" 2>/dev/null || true)
+    if [[ -n "$cur_src" ]]; then
+        local cur_uuid
+        cur_uuid=$(blkid -s UUID -o value "$cur_src" 2>/dev/null || true)
+        if [[ "$cur_uuid" != "$uuid" ]]; then
+            umount "$mountpoint" || die "could not unmount existing device from $mountpoint"
+            ok "unmounted previous device from $mountpoint"
+        fi
+    fi
+
     if ! findmnt -no TARGET "$mountpoint" >/dev/null 2>&1; then
         mount "$mountpoint" || die "mount $mountpoint failed"
     fi
@@ -245,10 +262,21 @@ _mode3_format_disk() {
 
     local mountpoint="/mnt/ftd-backup"
     mkdir -p "$mountpoint"
-    if ! grep -qE "^UUID=$uuid[[:space:]]" /etc/fstab; then
+
+    # Replace any existing fstab entry for this mountpoint.
+    local current_fstab_src
+    current_fstab_src=$(awk -v mp="$mountpoint" '$2 == mp && $1 !~ /^#/ {print $1; exit}' /etc/fstab || true)
+    if [[ "$current_fstab_src" != "UUID=$uuid" ]]; then
+        sed -i "\|[[:space:]]${mountpoint}[[:space:]]|d" /etc/fstab
         echo "UUID=$uuid  $mountpoint  ext4  defaults,noatime,nofail  0  2" >> /etc/fstab
     fi
     systemctl daemon-reload || true
+
+    # Unmount any device currently at the mountpoint before mounting the new one.
+    if mountpoint -q "$mountpoint" 2>/dev/null; then
+        umount "$mountpoint" || die "could not unmount existing device from $mountpoint"
+    fi
+
     mount "$mountpoint" || die "mount $mountpoint failed"
     STORAGE_UNDERLYING="$mountpoint"
     ok "drive formatted and mounted at $mountpoint"
