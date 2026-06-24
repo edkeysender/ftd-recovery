@@ -57,6 +57,9 @@ fi
 # ── Step 1: tear down current storage ───────────────────────────────────────
 log "removing current storage configuration"
 
+# Stop the app so nothing holds the mount open.
+systemctl stop recovery-interface 2>/dev/null || true
+
 # Unmount in order: bind first, then underlying device.
 if mountpoint -q "$STORAGE_BIND" 2>/dev/null; then
     umount "$STORAGE_BIND"
