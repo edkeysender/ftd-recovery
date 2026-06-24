@@ -313,6 +313,9 @@ _setup_bind_mount() {
         mount "$STORAGE_BIND" || die "bind-mount $STORAGE_BIND failed"
     fi
 
+    # Sticky + world-writable so NFS clients (root-squashed to nobody) can write.
+    chmod 1777 "$STORAGE_BIND"
+
     touch "$STORAGE_BIND/.ftd-writetest" || die "$STORAGE_BIND is not writable"
     rm -f "$STORAGE_BIND/.ftd-writetest"
     ok "$STORAGE_BIND is mounted and writable"
