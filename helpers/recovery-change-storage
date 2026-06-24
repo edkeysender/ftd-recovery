@@ -57,17 +57,18 @@ fi
 # ── Step 1: tear down current storage ───────────────────────────────────────
 log "removing current storage configuration"
 
-# Stop the app and unexport NFS so nothing holds the mount open.
-systemctl stop recovery-interface 2>/dev/null || true
-exportfs -u "*:/srv/clonezilla-images" 2>/dev/null || true
+# Stop services that hold the mount open.
+systemctl stop recovery-interface nfs-server 2>/dev/null || true
+exportfs -ua 2>/dev/null || true
 
 # Unmount in order: bind first, then underlying device.
+# Fall back to lazy unmount (-l) if something still holds it briefly.
 if mountpoint -q "$STORAGE_BIND" 2>/dev/null; then
-    umount "$STORAGE_BIND"
+    umount "$STORAGE_BIND" 2>/dev/null || umount -l "$STORAGE_BIND"
     ok "unmounted $STORAGE_BIND"
 fi
 if [[ -n "$underlying" ]] && mountpoint -q "$underlying" 2>/dev/null; then
-    umount "$underlying"
+    umount "$underlying" 2>/dev/null || umount -l "$underlying"
     ok "unmounted $underlying"
 fi
 
@@ -83,6 +84,7 @@ ok "old fstab entries removed"
 choose_storage
 
 # ── Step 3: restart services ─────────────────────────────────────────────────
+systemctl start nfs-server 2>/dev/null || true
 exportfs -ra 2>/dev/null || true
 systemctl restart recovery-interface
 ok "recovery-interface restarted"
