@@ -1656,6 +1656,7 @@ INDEX_HTML = """<!doctype html>
     <div>
       <div class="brand">FTD Aero Recovery Center</div>
       <h1>Recovery Status</h1>
+      <div class="sub" id="versionTag"></div>
       <div class="sub" id="meta">Loading…</div>
     </div>
     <button class="scan" id="addDevicesBtn">+ Add backup devices</button>
@@ -2314,6 +2315,10 @@ async function refreshDriveHealth() {
     if (s && s.ok) renderStorageBanner(banner, s);
   } catch (e) { /* silent */ }
 }
+
+fetch('/api/version').then(r => r.json()).then(d => {
+  document.getElementById('versionTag').textContent = 'v' + d.version;
+}).catch(() => {});
 
 refresh();
 refreshBackups();
