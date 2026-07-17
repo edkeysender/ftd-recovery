@@ -35,7 +35,7 @@ SERVER_IP=""
 SUBNET_CIDR=""
 
 # Clonezilla payload — override via env if mirrors change.
-CLONEZILLA_VERSION="${CLONEZILLA_VERSION:-3.1.2-22}"
+CLONEZILLA_VERSION="${CLONEZILLA_VERSION:-3.3.3-15}"
 CLONEZILLA_ISO_URL="${CLONEZILLA_ISO_URL:-https://sourceforge.net/projects/clonezilla/files/clonezilla_live_stable/${CLONEZILLA_VERSION}/clonezilla-live-${CLONEZILLA_VERSION}-amd64.iso/download}"
 
 # Debian netboot tarball (provides grubnetx64.efi + grub modules).

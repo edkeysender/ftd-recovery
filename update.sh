@@ -88,7 +88,41 @@ install -m 0644 "$SCRIPT_DIR/app/app.py" "$INSTALL_PREFIX/app.py"
 install -m 0644 "$SCRIPT_DIR/VERSION"    "$INSTALL_PREFIX/VERSION"
 ok "app updated"
 
-# ── Step 6: restart services ─────────────────────────────────────────────────
+# ── Step 6: OCS scripts (ocs-backup.sh / ocs-restore.sh) ────────────────────
+log "updating OCS scripts"
+SERVER_IP=$(sed -nE 's|.*API="http://([^:]+):.*|\1|p' /srv/tftp/ocs-backup.sh 2>/dev/null | head -1 || true)
+if [[ -n "$SERVER_IP" ]]; then
+    sed "s|__SERVER_IP__|$SERVER_IP|g" "$SCRIPT_DIR/tftp/ocs-backup.sh"  > /srv/tftp/ocs-backup.sh
+    sed "s|__SERVER_IP__|$SERVER_IP|g" "$SCRIPT_DIR/tftp/ocs-restore.sh" > /srv/tftp/ocs-restore.sh
+    chmod 0755 /srv/tftp/ocs-backup.sh /srv/tftp/ocs-restore.sh
+    ok "OCS scripts updated (server IP: $SERVER_IP)"
+else
+    warn "could not detect server IP from existing OCS scripts — skipping"
+fi
+
+# ── Step 7: Clonezilla payload ───────────────────────────────────────────────
+CLONEZILLA_VERSION="${CLONEZILLA_VERSION:-3.3.3-15}"
+CZ_VERSION_FILE="/srv/tftp/clonezilla/VERSION"
+current_cz=$(cat "$CZ_VERSION_FILE" 2>/dev/null || echo "")
+if [[ "$current_cz" == "$CLONEZILLA_VERSION" ]]; then
+    ok "Clonezilla $CLONEZILLA_VERSION already current"
+else
+    log "updating Clonezilla $current_cz → $CLONEZILLA_VERSION (~700 MB, please wait)"
+    CZ_URL="https://sourceforge.net/projects/clonezilla/files/clonezilla_live_stable/${CLONEZILLA_VERSION}/clonezilla-live-${CLONEZILLA_VERSION}-amd64.iso/download"
+    tmp=$(mktemp -d -t clonezilla-XXXXXX)
+    curl -fL --progress-bar "$CZ_URL" -o "$tmp/cz.iso"
+    mkdir -p "$tmp/iso"
+    mount -o loop,ro "$tmp/cz.iso" "$tmp/iso"
+    install -m 0644 "$tmp/iso/live/vmlinuz"             /srv/tftp/clonezilla/vmlinuz
+    install -m 0644 "$tmp/iso/live/initrd.img"          /srv/tftp/clonezilla/initrd.img
+    install -m 0644 "$tmp/iso/live/filesystem.squashfs" /srv/tftp/clonezilla/filesystem.squashfs
+    umount "$tmp/iso"
+    echo "$CLONEZILLA_VERSION" > "$CZ_VERSION_FILE"
+    rm -rf "$tmp"
+    ok "Clonezilla updated to $CLONEZILLA_VERSION"
+fi
+
+# ── Step 8: restart services ─────────────────────────────────────────────────
 log "restarting services"
 systemctl restart recovery-interface
 ok "recovery-interface restarted"
