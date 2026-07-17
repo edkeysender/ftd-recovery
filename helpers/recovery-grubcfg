@@ -45,10 +45,6 @@ case "$action" in
     cat > "$tmp" <<EOF
 set timeout=0
 set default=0
-set gfxmode=auto
-insmod all_video
-insmod gfxterm
-terminal_output gfxterm
 
 menuentry "$label" {
     linux (tftp)/clonezilla/vmlinuz boot=live locales=en_US.UTF-8 keyboard-layouts=us union=overlay username=user config components noswap edd=on nomodeset enforcing=0 noeject fetch=http://__SERVER_IP__:8080/clonezilla/filesystem.squashfs ${image_arg}ocs_prerun1="mount -t nfs __SERVER_IP__:/srv/clonezilla-images /home/partimag" ocs_prerun2="wget -q http://__SERVER_IP__:8080/${script} -O /tmp/r.sh" ocs_prerun3="chmod +x /tmp/r.sh" ocs_live_run="/tmp/r.sh" ocs_live_batch=no
