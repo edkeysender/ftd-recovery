@@ -85,12 +85,12 @@ _mode2_adopt_partition() {
         local -a p_names=() p_sizes=() p_fstypes=() p_mounts=()
         local name pkname short fstype mp
 
-        local -a p_is_os=()
         while read -r name; do
             [[ -z "$name" ]] && continue
             [[ "$(lsblk -no TYPE "$name" 2>/dev/null | xargs)" != "part" ]] && continue
             pkname=$(lsblk -no PKNAME "$name" 2>/dev/null | xargs || true)
             short=${pkname##*/}
+            _is_system_disk "$short" && continue
             fstype=$(lsblk -no FSTYPE "$name" 2>/dev/null | xargs || true)
             [[ "$fstype" == "swap" ]] && continue
             mp=$(lsblk -no MOUNTPOINT "$name" 2>/dev/null | xargs || true)
@@ -98,22 +98,19 @@ _mode2_adopt_partition() {
             p_sizes+=("$(lsblk -no SIZE "$name" | xargs)")
             p_fstypes+=("${fstype:-(none)}")
             p_mounts+=("${mp:-(not mounted)}")
-            _is_system_disk "$short" && p_is_os+=(1) || p_is_os+=(0)
         done < <(lsblk -lpno NAME)
 
-        [[ ${#p_names[@]} -eq 0 ]] && die "no eligible partitions found"
+        [[ ${#p_names[@]} -eq 0 ]] && die "no eligible partitions found (system disk excluded)"
 
         {
             echo
-            echo "${BOLD}Available partitions:${RESET}"
+            echo "${BOLD}Available partitions:${RESET} ${DIM}(system disk excluded)${RESET}"
             echo
             local i
             for i in "${!p_names[@]}"; do
-                local os_tag=""
-                [[ "${p_is_os[$i]}" == "1" ]] && os_tag=" ${YELLOW}[OS DISK]${RESET}"
-                printf '  %s%d)%s %-15s  %-8s  %-10s  %s%s\n' \
+                printf '  %s%d)%s %-15s  %-8s  %-10s  %s\n' \
                     "$BOLD" "$((i+1))" "$RESET" \
-                    "${p_names[$i]}" "${p_sizes[$i]}" "${p_fstypes[$i]}" "${p_mounts[$i]}" "$os_tag"
+                    "${p_names[$i]}" "${p_sizes[$i]}" "${p_fstypes[$i]}" "${p_mounts[$i]}"
             done
             echo
         } >&2
@@ -122,12 +119,7 @@ _mode2_adopt_partition() {
         while true; do
             read -r -p "${BOLD}Partition to use${RESET} [1-${#p_names[@]}]: " reply </dev/tty
             if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#p_names[@]} )); then
-                local idx=$(( reply - 1 ))
-                if [[ "${p_is_os[$idx]}" == "1" ]]; then
-                    warn "That partition is on the OS disk. If this drive fails you lose both the system and all backups."
-                    confirm "Use OS disk partition anyway?" "n" || continue
-                fi
-                dev="${p_names[$idx]}"; break
+                dev="${p_names[$((reply-1))]}"; break
             fi
             warn "enter a number between 1 and ${#p_names[@]}"
         done
