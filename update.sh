@@ -75,7 +75,25 @@ ok "lib files updated"
 log "updating helper scripts"
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-remount"        /usr/local/bin/recovery-remount
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-change-storage" /usr/local/bin/recovery-change-storage
+install -m 0755 "$SCRIPT_DIR/helpers/recovery-allowlist"      /usr/local/bin/recovery-allowlist
 ok "helpers updated"
+
+# ── Step 3a: dnsmasq config ──────────────────────────────────────────────────
+log "updating dnsmasq config"
+IFACE=$(grep -oP '(?<=^interface=)\S+' /etc/dnsmasq.d/clonezilla-pxe.conf 2>/dev/null || true)
+SUBNET=$(grep -oP '(?<=^dhcp-range=)\S+(?=,proxy)' /etc/dnsmasq.d/clonezilla-pxe.conf 2>/dev/null || true)
+if [[ -n "$IFACE" && -n "$SUBNET" ]]; then
+    sed -e "s|__INTERFACE__|$IFACE|g" -e "s|__SUBNET_BASE__|$SUBNET|g" \
+        "$SCRIPT_DIR/dnsmasq.d/clonezilla-pxe.conf" > /etc/dnsmasq.d/clonezilla-pxe.conf
+    if systemctl is-active --quiet dnsmasq; then
+        systemctl reload dnsmasq
+    else
+        systemctl start dnsmasq || warn "dnsmasq failed to start — check: journalctl -u dnsmasq -n 20"
+    fi
+    ok "dnsmasq config updated"
+else
+    warn "could not detect interface/subnet from existing dnsmasq config — skipping"
+fi
 
 # ── Step 4: sudoers ──────────────────────────────────────────────────────────
 log "updating sudoers"

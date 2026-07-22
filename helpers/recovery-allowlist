@@ -48,4 +48,8 @@ esac
 mv "$tmp" "$FILE"
 
 # Tell dnsmasq to re-read the hostsfile.
-systemctl reload dnsmasq.service
+if systemctl is-active --quiet dnsmasq.service; then
+    systemctl reload dnsmasq.service
+else
+    echo "dnsmasq is not active — allowlist file updated, reload skipped" >&2
+fi
