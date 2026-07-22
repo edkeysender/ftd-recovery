@@ -17,6 +17,22 @@ _show_block_devices() {
     echo "${DIM}Current block devices:${RESET}"
     lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,LABEL,MODEL
     echo
+
+    # Show which disk(s) host the OS so the user knows what to avoid.
+    local sys_disks=() disk_name disk_model
+    while read -r name; do
+        [[ -z "$name" ]] && continue
+        disk_name=${name##*/}
+        _is_system_disk "$disk_name" || continue
+        disk_model=$(lsblk -dno MODEL "$name" 2>/dev/null | xargs || echo "?")
+        sys_disks+=("$name ($disk_model)")
+    done < <(lsblk -dpno NAME)
+
+    if [[ ${#sys_disks[@]} -gt 0 ]]; then
+        echo "${YELLOW}${BOLD}OS installed on:${RESET} ${sys_disks[*]}"
+        echo "${DIM}(excluded from backup storage options)${RESET}"
+        echo
+    fi
 }
 
 # _is_system_disk <disk-name> — true if this disk hosts / or /boot/firmware.
