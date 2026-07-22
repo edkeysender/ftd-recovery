@@ -94,7 +94,6 @@ _mode2_adopt_partition() {
             fstype=$(lsblk -no FSTYPE "$name" 2>/dev/null | xargs || true)
             [[ "$fstype" == "swap" ]] && continue
             mp=$(lsblk -no MOUNTPOINT "$name" 2>/dev/null | xargs || true)
-            case "$mp" in /|/boot|/boot/*|/usr|/usr/*|/var|/var/*) continue ;; esac
             p_names+=("$name")
             p_sizes+=("$(lsblk -no SIZE "$name" | xargs)")
             p_fstypes+=("${fstype:-(none)}")
