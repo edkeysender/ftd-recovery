@@ -67,16 +67,24 @@ if mountpoint -q "$STORAGE_BIND" 2>/dev/null; then
     umount "$STORAGE_BIND" 2>/dev/null || umount -l "$STORAGE_BIND"
     ok "unmounted $STORAGE_BIND"
 fi
-if [[ -n "$underlying" ]] && mountpoint -q "$underlying" 2>/dev/null; then
-    umount "$underlying" 2>/dev/null || umount -l "$underlying"
-    ok "unmounted $underlying"
-fi
+case "${underlying:-}" in
+    /|/boot|/boot/*|/usr|/usr/*|/var|/var/*)
+        warn "current storage is on a system path ($underlying) — skipping unmount" ;;
+    "")
+        : ;;
+    *)
+        if mountpoint -q "$underlying" 2>/dev/null; then
+            umount "$underlying" 2>/dev/null || umount -l "$underlying"
+            ok "unmounted $underlying"
+        fi ;;
+esac
 
 # Remove old fstab entries for the bind and underlying mount.
 sed -i "\|[[:space:]]${STORAGE_BIND}[[:space:]]|d" /etc/fstab
-if [[ -n "$underlying" ]]; then
-    sed -i "\|[[:space:]]${underlying}[[:space:]]|d" /etc/fstab
-fi
+case "${underlying:-}" in
+    /|/boot|/boot/*|/usr|/usr/*|/var|/var/*|"") : ;;
+    *) sed -i "\|[[:space:]]${underlying}[[:space:]]|d" /etc/fstab ;;
+esac
 systemctl daemon-reload || true
 ok "old fstab entries removed"
 
