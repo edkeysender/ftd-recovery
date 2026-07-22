@@ -169,7 +169,16 @@ _mode2_adopt_partition() {
     fi
 
     if ! findmnt -no TARGET "$mountpoint" >/dev/null 2>&1; then
-        mount "$mountpoint" || die "mount $mountpoint failed"
+        if ! mount "$mountpoint" 2>/dev/null; then
+            warn "mount failed — filesystem may need repair"
+            if confirm "Run fsck to repair $dev now?" "y"; then
+                fsck -y "$dev" || true
+                mount "$mountpoint" || die "mount $mountpoint failed even after fsck"
+                ok "filesystem repaired and mounted"
+            else
+                die "mount $mountpoint failed — run: sudo fsck -y $dev"
+            fi
+        fi
     fi
     STORAGE_UNDERLYING="$mountpoint"
     ok "$dev mounted at $mountpoint"
