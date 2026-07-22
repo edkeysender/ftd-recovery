@@ -338,6 +338,119 @@ _setup_bind_mount() {
     ok "$STORAGE_BIND is mounted and writable"
 }
 
+# pick_storage — interactive selection only; sets PICK_MODE (adopt|format) and PICK_DEV.
+# Does NOT mount anything or modify fstab. Used by recovery-change-storage so the user
+# chooses the replacement BEFORE the current storage is torn down.
+PICK_MODE=""
+PICK_DEV=""
+
+pick_storage() {
+    _show_block_devices
+
+    echo "${BOLD}How should backups be stored?${RESET}"
+    echo "  1) Use an existing external drive (already formatted)"
+    echo "  2) Erase and set up a blank drive (removes all data on that drive)"
+    echo
+    local choice
+    while true; do
+        choice=$(ask "Choose 1/2" "1")
+        case "$choice" in
+            1) _pick_partition; break ;;
+            2) _pick_disk;      break ;;
+            *) warn "enter 1 or 2" ;;
+        esac
+    done
+}
+
+_pick_partition() {
+    local -a p_names=() p_sizes=() p_fstypes=() p_mounts=()
+    local name pkname short fstype mp
+
+    while read -r name; do
+        [[ -z "$name" ]] && continue
+        [[ "$(lsblk -no TYPE "$name" 2>/dev/null | xargs)" != "part" ]] && continue
+        pkname=$(lsblk -no PKNAME "$name" 2>/dev/null | xargs || true)
+        short=${pkname##*/}
+        _is_system_disk "$short" && continue
+        fstype=$(lsblk -no FSTYPE "$name" 2>/dev/null | xargs || true)
+        [[ "$fstype" == "swap" ]] && continue
+        mp=$(lsblk -no MOUNTPOINT "$name" 2>/dev/null | xargs || true)
+        p_names+=("$name")
+        p_sizes+=("$(lsblk -no SIZE "$name" | xargs)")
+        p_fstypes+=("${fstype:-(none)}")
+        p_mounts+=("${mp:-(not mounted)}")
+    done < <(lsblk -lpno NAME)
+
+    [[ ${#p_names[@]} -eq 0 ]] && die "no eligible partitions found (system disk excluded)"
+
+    {
+        echo
+        echo "${BOLD}Available partitions:${RESET} ${DIM}(system disk excluded)${RESET}"
+        echo
+        local i
+        for i in "${!p_names[@]}"; do
+            printf '  %s%d)%s %-15s  %-8s  %-10s  %s\n' \
+                "$BOLD" "$((i+1))" "$RESET" \
+                "${p_names[$i]}" "${p_sizes[$i]}" "${p_fstypes[$i]}" "${p_mounts[$i]}"
+        done
+        echo
+    } >&2
+
+    local reply
+    while true; do
+        read -r -p "${BOLD}Partition to use${RESET} [1-${#p_names[@]}]: " reply </dev/tty
+        if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#p_names[@]} )); then
+            PICK_DEV="${p_names[$((reply-1))]}"; PICK_MODE="adopt"; break
+        fi
+        warn "enter a number between 1 and ${#p_names[@]}"
+    done
+}
+
+_pick_disk() {
+    local -a d_names=() d_sizes=() d_models=() d_infos=()
+    local name short risky
+
+    while read -r name; do
+        [[ -z "$name" ]] && continue
+        short=${name##*/}
+        [[ "$short" =~ ^(loop|zram|ram|sr) ]] && continue
+        [[ "$(lsblk -dno TYPE "$name" 2>/dev/null)" != "disk" ]] && continue
+        _is_system_disk "$short" && continue
+        risky=""
+        while read -r _c cmp; do
+            case "$cmp" in /|/boot|/boot/*|/usr|/usr/*|/var|/var/*) risky=1 ;; esac
+        done < <(lsblk -lpno NAME,MOUNTPOINT "$name" | grep -v "^$name ")
+        [[ -n "$risky" ]] && continue
+        d_names+=("$name")
+        d_sizes+=("$(lsblk -dno SIZE "$name")")
+        d_models+=("$(lsblk -dno MODEL "$name" | xargs || echo '?')")
+        d_infos+=("$(_disk_partition_info "$name")")
+    done < <(lsblk -dpno NAME)
+
+    [[ ${#d_names[@]} -eq 0 ]] && die "no eligible drives found"
+
+    {
+        echo
+        echo "${BOLD}Available drives:${RESET}"
+        local i
+        for i in "${!d_names[@]}"; do
+            printf '  %s%d)%s %-15s  %-8s  %-28s  %s\n' \
+                "$BOLD" "$((i+1))" "$RESET" \
+                "${d_names[$i]}" "${d_sizes[$i]}" "${d_models[$i]}" "${d_infos[$i]}"
+        done
+        echo
+    } >&2
+
+    local reply
+    while true; do
+        read -r -p "${BOLD}Drive to erase and use${RESET} [1-${#d_names[@]}]: " reply </dev/tty
+        if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#d_names[@]} )); then
+            PICK_DEV="${d_names[$((reply-1))]}"; PICK_MODE="format"; break
+        fi
+        warn "enter a number between 1 and ${#d_names[@]}"
+    done
+}
+
 choose_storage() {
     _show_block_devices
 

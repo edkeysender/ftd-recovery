@@ -20,7 +20,7 @@ echo
 echo "${BOLD}${CYAN}FTD Recovery — change backup storage${RESET}"
 echo
 
-# ── Show current storage and confirm ────────────────────────────────────────
+# ── Show current storage ─────────────────────────────────────────────────────
 bind_src=$(awk '$2 == "/srv/clonezilla-images" && $1 !~ /^#/ {print $1; exit}' /etc/fstab || true)
 underlying=""
 if [[ -n "$bind_src" ]]; then
@@ -38,16 +38,22 @@ else
     [[ -n "$underlying" ]] && echo "  configured mount: $underlying"
 fi
 echo
-warn "This will unmount the current drive and let you pick a new one."
-warn "Existing backup images on the old drive will not be deleted."
+
+# ── Pick new storage BEFORE touching anything ────────────────────────────────
+pick_storage
+
 echo
-if ! confirm "Continue?" "n"; then
+echo "${BOLD}Ready to switch:${RESET}"
+echo "  from : ${underlying:-(none)}"
+echo "  to   : $PICK_DEV"
+echo
+warn "The current drive will be unmounted. Existing backup images will not be deleted."
+echo
+if ! confirm "Proceed?" "n"; then
     echo "Aborted."; exit 0
 fi
 
 # ── Capture old device before teardown ──────────────────────────────────────
-# If the underlying path is a mounted block device, save it so we can offer
-# to remount it later and copy images across.
 old_bind_src="$bind_src"
 old_device=""
 if [[ -n "$underlying" ]] && mountpoint -q "$underlying" 2>/dev/null; then
@@ -88,8 +94,12 @@ esac
 systemctl daemon-reload || true
 ok "old fstab entries removed"
 
-# ── Step 2: pick new storage ─────────────────────────────────────────────────
-choose_storage
+# ── Step 2: apply selected storage ───────────────────────────────────────────
+case "$PICK_MODE" in
+    adopt)  _mode2_adopt_partition "$PICK_DEV" ;;
+    format) _mode3_format_disk     "$PICK_DEV" ;;
+esac
+_setup_bind_mount
 
 # ── Step 3: restart services ─────────────────────────────────────────────────
 systemctl start nfs-server 2>/dev/null || true
