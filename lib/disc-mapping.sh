@@ -87,6 +87,7 @@ _mode2_adopt_partition() {
 
         while read -r name; do
             [[ -z "$name" ]] && continue
+            [[ "$(lsblk -no TYPE "$name" 2>/dev/null | xargs)" != "part" ]] && continue
             pkname=$(lsblk -no PKNAME "$name" 2>/dev/null | xargs || true)
             short=${pkname##*/}
             _is_system_disk "$short" && continue
@@ -98,14 +99,22 @@ _mode2_adopt_partition() {
             p_sizes+=("$(lsblk -no SIZE "$name" | xargs)")
             p_fstypes+=("${fstype:-(none)}")
             p_mounts+=("${mp:-(not mounted)}")
-        done < <(lsblk -lpno NAME | awk '$1 ~ /[0-9]$/')
+        done < <(lsblk -lpno NAME)
 
         [[ ${#p_names[@]} -eq 0 ]] && die "no eligible partitions found (system disk excluded)"
 
         {
             echo
-            echo "${BOLD}Available partitions:${RESET}"
-            local i
+            echo "${BOLD}Available partitions:${RESET} ${DIM}(system disk excluded)${RESET}"
+            local i sys_disk sys_model sys_note=""
+            while read -r d; do
+                local dn=${d##*/}
+                _is_system_disk "$dn" || continue
+                sys_model=$(lsblk -dno MODEL "$d" 2>/dev/null | xargs || echo "?")
+                sys_note+=" ${YELLOW}${d} = OS (${sys_model})${RESET}"
+            done < <(lsblk -dpno NAME)
+            [[ -n "$sys_note" ]] && echo "${DIM}OS disk:${RESET}${sys_note}"
+            echo
             for i in "${!p_names[@]}"; do
                 printf '  %s%d)%s %-15s  %-8s  %-10s  %s\n' \
                     "$BOLD" "$((i+1))" "$RESET" \
