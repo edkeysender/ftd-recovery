@@ -2,9 +2,9 @@
 # Switch the backup storage drive without reinstalling.
 # Usage: sudo recovery-change-storage
 #
-# Tears down the current storage mount, runs the interactive storage
-# picker (same as the installer), updates fstab, and restarts the app.
-# Optionally copies existing backup images from the old drive to the new one.
+# Keeps the old drive mounted throughout so images can be copied without
+# a remount step. Only the bind (/srv/clonezilla-images) is torn down
+# while the switch happens; the old underlying device stays accessible.
 
 set -euo pipefail
 
@@ -20,7 +20,7 @@ echo
 echo "${BOLD}${CYAN}FTD Recovery — change backup storage${RESET}"
 echo
 
-# ── Show current storage ─────────────────────────────────────────────────────
+# ── Show current storage ──────────────────────────────────────────────────────
 bind_src=$(awk '$2 == "/srv/clonezilla-images" && $1 !~ /^#/ {print $1; exit}' /etc/fstab || true)
 underlying=""
 if [[ -n "$bind_src" ]]; then
@@ -39,7 +39,7 @@ else
 fi
 echo
 
-# ── Pick new storage BEFORE touching anything ────────────────────────────────
+# ── Pick new storage BEFORE touching anything ─────────────────────────────────
 pick_storage
 
 echo
@@ -47,77 +47,71 @@ echo "${BOLD}Ready to switch:${RESET}"
 echo "  from : ${underlying:-(none)}"
 echo "  to   : $PICK_DEV"
 echo
-warn "The current drive will be unmounted. Existing backup images will not be deleted."
+warn "The bind mount will be briefly interrupted. The old drive stays mounted for image copying."
 echo
 if ! confirm "Proceed?" "n"; then
     echo "Aborted."; exit 0
 fi
 
-# ── Capture old device before teardown ──────────────────────────────────────
-old_bind_src="$bind_src"
-old_device=""
-if [[ -n "$underlying" ]] && mountpoint -q "$underlying" 2>/dev/null; then
-    old_device=$(findmnt -no SOURCE "$underlying" 2>/dev/null || true)
-fi
-
-# ── Step 1: tear down current storage ───────────────────────────────────────
-log "removing current storage configuration"
-
-# Stop services that hold the mount open.
+# ── Step 1: release the bind only ────────────────────────────────────────────
+log "releasing bind mount"
 systemctl stop recovery-interface nfs-server 2>/dev/null || true
 exportfs -ua 2>/dev/null || true
 
-# Unmount in order: bind first, then underlying device.
-# Fall back to lazy unmount (-l) if something still holds it briefly.
 if mountpoint -q "$STORAGE_BIND" 2>/dev/null; then
     umount "$STORAGE_BIND" 2>/dev/null || umount -l "$STORAGE_BIND"
     ok "unmounted $STORAGE_BIND"
 fi
-case "${underlying:-}" in
-    /|/boot|/boot/*|/usr|/usr/*|/var|/var/*)
-        warn "current storage is on a system path ($underlying) — skipping unmount" ;;
-    "")
-        : ;;
-    *)
-        if mountpoint -q "$underlying" 2>/dev/null; then
-            umount "$underlying" 2>/dev/null || umount -l "$underlying"
-            ok "unmounted $underlying"
-        fi ;;
-esac
 
-# Remove old fstab entries for the bind and underlying mount.
+# Remove only the bind fstab entry — leave the underlying device entry in place.
 sed -i "\|[[:space:]]${STORAGE_BIND}[[:space:]]|d" /etc/fstab
-case "${underlying:-}" in
-    /|/boot|/boot/*|/usr|/usr/*|/var|/var/*|"") : ;;
-    *) sed -i "\|[[:space:]]${underlying}[[:space:]]|d" /etc/fstab ;;
-esac
 systemctl daemon-reload || true
-ok "old fstab entries removed"
+ok "bind fstab entry removed"
 
-# ── Step 2: apply selected storage ───────────────────────────────────────────
-case "$PICK_MODE" in
-    adopt)  _mode2_adopt_partition "$PICK_DEV" ;;
-    format) _mode3_format_disk     "$PICK_DEV" ;;
-esac
-_setup_bind_mount
+# ── Step 2: mount new device at a temp path ───────────────────────────────────
+log "mounting new device"
+new_uuid=$(blkid -s UUID -o value "$PICK_DEV" 2>/dev/null || true)
+new_fstype=$(blkid -s TYPE -o value "$PICK_DEV" 2>/dev/null || true)
+[[ -z "$new_uuid" ]]   && die "$PICK_DEV has no filesystem"
+[[ -z "$new_fstype" ]] && die "$PICK_DEV has no recognised filesystem"
 
-# ── Step 3: restart services ─────────────────────────────────────────────────
+new_mnt=$(mktemp -d /mnt/ftd-new-XXXXXX)
+if ! mount -t "$new_fstype" "$PICK_DEV" "$new_mnt" 2>/dev/null; then
+    if confirm "Mount failed — run fsck to repair $PICK_DEV?" "y"; then
+        fsck -y "$PICK_DEV" || true
+        mount -t "$new_fstype" "$PICK_DEV" "$new_mnt" || die "mount failed even after fsck"
+        ok "filesystem repaired and mounted"
+    else
+        rmdir "$new_mnt" 2>/dev/null || true
+        die "could not mount $PICK_DEV"
+    fi
+fi
+ok "new device mounted at $new_mnt"
+
+# ── Step 3: set up bind from new device ───────────────────────────────────────
+log "setting up bind mount"
+mkdir -p "$new_mnt/clonezilla-images"
+chmod 1777 "$new_mnt/clonezilla-images"
+echo "$new_mnt/clonezilla-images  $STORAGE_BIND  none  bind,nofail  0  0" >> /etc/fstab
+systemctl daemon-reload || true
+mount "$STORAGE_BIND" || die "bind-mount failed"
+touch "$STORAGE_BIND/.ftd-writetest" || die "$STORAGE_BIND is not writable"
+rm -f "$STORAGE_BIND/.ftd-writetest"
+ok "$STORAGE_BIND is mounted and writable"
+
+# ── Step 4: restart services ───────────────────────────────────────────────────
 systemctl start nfs-server 2>/dev/null || true
 exportfs -ra 2>/dev/null || true
 systemctl restart recovery-interface
 ok "recovery-interface restarted"
 
 echo
-echo "${BOLD}${GREEN}Storage changed.${RESET} New path: $STORAGE_UNDERLYING"
-echo "Existing images on the old drive were not touched."
+echo "${BOLD}${GREEN}New storage active.${RESET}"
 
-# ── Step 4: offer to copy backups from old storage ───────────────────────────
+# ── Step 5: copy from old drive (still mounted — no remount needed) ───────────
 _copy_old_backups() {
-    local src_images=$1  # directory containing the image folders to copy from
-
-    if [[ ! -d "$src_images" ]]; then
-        return
-    fi
+    local src_images=$1
+    [[ ! -d "$src_images" ]] && return
 
     local -a images=()
     mapfile -t images < <(find "$src_images" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
@@ -140,10 +134,7 @@ _copy_old_backups() {
     local reply
     read -r -p "${BOLD}Copy which images to new drive? (number, 'a' for all, Enter to skip):${RESET} " reply </dev/tty
 
-    if [[ -z "$reply" ]]; then
-        log "skipping copy"
-        return
-    fi
+    [[ -z "$reply" ]] && { log "skipping copy"; return; }
 
     local -a to_copy=()
     if [[ "$reply" =~ ^[Aa]$ ]]; then
@@ -155,35 +146,62 @@ _copy_old_backups() {
         return
     fi
 
-    local dst="/srv/clonezilla-images"
-    log "copying ${#to_copy[@]} image(s) to $dst ..."
+    log "copying ${#to_copy[@]} image(s) to $STORAGE_BIND ..."
     local img
     for img in "${to_copy[@]}"; do
         log "copying $img ..."
-        rsync -a --info=progress2 "$src_images/$img" "$dst/"
+        rsync -a --info=progress2 "$src_images/$img" "$STORAGE_BIND/"
         ok "copied $img"
     done
 }
 
-if [[ -n "$old_bind_src" ]]; then
+if [[ -n "$bind_src" && -d "$bind_src" ]]; then
     echo
-    if [[ -n "$old_device" ]]; then
-        # Old storage was a mounted block device — remount temporarily.
-        tmp_mnt=$(mktemp -d /mnt/ftd-old-XXXXXX)
-        if mount "$old_device" "$tmp_mnt" 2>/dev/null; then
-            old_images_dir="$tmp_mnt/clonezilla-images"
-            if confirm "Copy existing backups from old drive to new one?" "n"; then
-                _copy_old_backups "$old_images_dir"
-            fi
-            umount "$tmp_mnt"
-        else
-            warn "could not remount old drive ($old_device); copy it manually if needed"
-        fi
-        rmdir "$tmp_mnt" 2>/dev/null || true
+    echo "${BOLD}Old drive is still mounted at $underlying.${RESET}"
+    echo "You can copy existing backup images to the new drive now."
+    if confirm "Copy existing backups from old drive to new one?" "y"; then
+        _copy_old_backups "$bind_src"
     else
-        # Old storage was a local folder — still accessible.
-        if confirm "Copy existing backups from old location to new one?" "n"; then
-            _copy_old_backups "$old_bind_src"
-        fi
+        log "skipping copy — old images remain at $underlying"
     fi
 fi
+
+# ── Step 6: clean up old mount and standardise new mount path ─────────────────
+log "finalising storage layout"
+
+# Unmount old underlying (if it's not a system path and still mounted).
+case "${underlying:-}" in
+    /|/boot|/boot/*|/usr|/usr/*|/var|/var/*|"") : ;;
+    *)
+        if mountpoint -q "$underlying" 2>/dev/null; then
+            umount "$underlying" 2>/dev/null || umount -l "$underlying"
+            ok "unmounted old drive ($underlying)"
+        fi
+        sed -i "\|[[:space:]]${underlying}[[:space:]]|d" /etc/fstab
+        ;;
+esac
+
+# Move new device from temp path to the standard /mnt/ftd-backup.
+std_mnt="/mnt/ftd-backup"
+if [[ "$new_mnt" != "$std_mnt" ]]; then
+    # Remove temp bind+underlying fstab entries and replace with standard paths.
+    sed -i "\|[[:space:]]${STORAGE_BIND}[[:space:]]|d" /etc/fstab
+    sed -i "\|[[:space:]]${new_mnt}[[:space:]]|d" /etc/fstab
+
+    umount "$STORAGE_BIND" 2>/dev/null || true
+    umount "$new_mnt"      2>/dev/null || true
+    rmdir  "$new_mnt"      2>/dev/null || true
+
+    mkdir -p "$std_mnt"
+    echo "UUID=$new_uuid  $std_mnt  $new_fstype  defaults,noatime,nofail  0  2" >> /etc/fstab
+    echo "$std_mnt/clonezilla-images  $STORAGE_BIND  none  bind,nofail,x-systemd.requires-mounts-for=$std_mnt  0  0" >> /etc/fstab
+    systemctl daemon-reload || true
+    mount "$std_mnt"      || die "final mount of $std_mnt failed"
+    mount "$STORAGE_BIND" || die "final bind-mount failed"
+    chmod 1777 "$STORAGE_BIND"
+    systemctl restart recovery-interface
+fi
+
+ok "storage layout finalised at $std_mnt"
+echo
+echo "${BOLD}${GREEN}Done.${RESET} Backup storage: $std_mnt ($PICK_DEV)"
