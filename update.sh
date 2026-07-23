@@ -140,10 +140,25 @@ else
     ok "Clonezilla updated to $CLONEZILLA_VERSION"
 fi
 
-# ── Step 8: restart services ─────────────────────────────────────────────────
+# ── Step 8: nfs-server autostart + ordering ──────────────────────────────────
+log "configuring nfs-server autostart"
+mkdir -p /etc/systemd/system/nfs-server.service.d
+install -m 0644 "$SCRIPT_DIR/systemd/nfs-server.service.d/ftd-recovery.conf" \
+    /etc/systemd/system/nfs-server.service.d/ftd-recovery.conf
+systemctl enable nfs-server 2>/dev/null || true
+systemctl daemon-reload
+ok "nfs-server enabled and ordered after bind mount"
+
+# ── Step 9: restart services ─────────────────────────────────────────────────
 log "restarting services"
+if mountpoint -q /srv/clonezilla-images 2>/dev/null; then
+    systemctl restart nfs-server 2>/dev/null || true
+    exportfs -ra 2>/dev/null || true
+else
+    warn "/srv/clonezilla-images not mounted — nfs-server not started (run: sudo mount -a)"
+fi
 systemctl restart recovery-interface
-ok "recovery-interface restarted"
+ok "services restarted"
 
 echo
 echo "${BOLD}${GREEN}Update complete.${RESET}"
