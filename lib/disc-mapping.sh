@@ -230,6 +230,19 @@ _erase_and_format() {
         die "confirmation failed — drive was not erased"
     fi
 
+    # Unmount any (auto-)mounted partitions on the target — parted can't
+    # relabel a disk that is in use. The picker already excluded disks with
+    # system mounts, and the operator just confirmed the erase.
+    local mounted_part
+    while read -r mounted_part; do
+        [[ -z "$mounted_part" ]] && continue
+        umount "$mounted_part" 2>/dev/null || umount -l "$mounted_part" 2>/dev/null || true
+    done < <(lsblk -lnpo NAME,MOUNTPOINT "$dev" | awk '$2 != "" {print $1}')
+    udevadm settle
+    if lsblk -lnpo MOUNTPOINT "$dev" | grep -q .; then
+        die "could not unmount partitions on $dev — close anything using the drive and re-run"
+    fi
+
     log "partitioning and formatting $dev"
     parted -s "$dev" mklabel gpt
     parted -s -a optimal "$dev" mkpart primary ext4 0% 100%
