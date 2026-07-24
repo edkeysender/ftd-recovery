@@ -207,6 +207,13 @@ _disk_partition_info() {
 FORMATTED_PART=""
 _erase_and_format() {
     local dev=$1
+
+    # A drive whose controller has locked itself read-only (worn-out flash,
+    # SD lock switch) cannot be written by any tool — fail clearly up front.
+    if [[ "$(cat "/sys/block/${dev##*/}/ro" 2>/dev/null)" == "1" ]]; then
+        die "$dev is hardware write-protected — it cannot be erased or reused (failing/locked device)"
+    fi
+
     local size model serial
     size=$(lsblk -dno SIZE "$dev")
     model=$(lsblk -dno MODEL "$dev" | xargs)
