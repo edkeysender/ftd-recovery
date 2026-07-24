@@ -235,6 +235,20 @@ if [[ "$new_mnt" != "$std_mnt" ]]; then
     echo "UUID=$new_uuid  $std_mnt  $new_fstype  defaults,noatime,nofail  0  2" >> /etc/fstab
     echo "$std_mnt/clonezilla-images  $STORAGE_BIND  none  bind,nofail,x-systemd.requires-mounts-for=$std_mnt  0  0" >> /etc/fstab
     systemctl daemon-reload || true
+    # If something is already mounted at the standard path, it must be the
+    # newly chosen device — otherwise it's a leftover (e.g. an old drive we
+    # couldn't identify because the bind was down) and must be evicted, or
+    # the bind would silently serve the wrong drive.
+    if mountpoint -q "$std_mnt" 2>/dev/null; then
+        cur_std_src=$(findmnt -no SOURCE "$std_mnt" 2>/dev/null || true)
+        cur_std_uuid=$(blkid -s UUID -o value "${cur_std_src%%[*}" 2>/dev/null || true)
+        if [[ "$cur_std_uuid" != "$new_uuid" ]]; then
+            umount "$std_mnt" 2>/dev/null || umount -l "$std_mnt" 2>/dev/null || true
+            if mountpoint -q "$std_mnt" 2>/dev/null; then
+                die "another device occupies $std_mnt and could not be unmounted — close anything using it and re-run"
+            fi
+        fi
+    fi
     if ! mountpoint -q "$std_mnt" 2>/dev/null; then
         mount "$std_mnt" || die "final mount of $std_mnt failed"
     fi
