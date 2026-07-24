@@ -42,6 +42,19 @@ echo
 # ── Pick new storage BEFORE touching anything ─────────────────────────────────
 pick_storage
 
+# Validate an adopted partition up front — fail while current storage is
+# still intact, not after the bind is torn down.
+if [[ "$PICK_MODE" == "adopt" ]]; then
+    adopt_fstype=$(blkid -s TYPE -o value "$PICK_DEV" 2>/dev/null || true)
+    case "$adopt_fstype" in
+        ext4|ext3|ext2|xfs|btrfs) : ;;
+        "")
+            die "$PICK_DEV has no filesystem — use option 2 to erase and format it" ;;
+        *)
+            die "$PICK_DEV is $adopt_fstype — backup storage needs a Linux filesystem (chmod/NFS permissions don't work on $adopt_fstype). Use option 2 to erase and format the drive as ext4." ;;
+    esac
+fi
+
 echo
 echo "${BOLD}Ready to switch:${RESET}"
 echo "  from : ${underlying:-(none)}"
@@ -216,10 +229,15 @@ if [[ "$new_mnt" != "$std_mnt" ]]; then
     rmdir "$new_mnt" 2>/dev/null || true
 
     mkdir -p "$std_mnt"
+    # Drop any existing entry for the standard mountpoint first (e.g. when
+    # re-adopting the drive that is already there) so we never duplicate it.
+    fstab_remove_mount "$std_mnt"
     echo "UUID=$new_uuid  $std_mnt  $new_fstype  defaults,noatime,nofail  0  2" >> /etc/fstab
     echo "$std_mnt/clonezilla-images  $STORAGE_BIND  none  bind,nofail,x-systemd.requires-mounts-for=$std_mnt  0  0" >> /etc/fstab
     systemctl daemon-reload || true
-    mount "$std_mnt"      || die "final mount of $std_mnt failed"
+    if ! mountpoint -q "$std_mnt" 2>/dev/null; then
+        mount "$std_mnt" || die "final mount of $std_mnt failed"
+    fi
     mount "$STORAGE_BIND" || die "final bind-mount failed"
     chmod 1777 "$STORAGE_BIND"
 
