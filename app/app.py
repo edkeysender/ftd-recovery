@@ -152,6 +152,18 @@ def save_state(state: dict) -> None:
     tmp.replace(STATE_FILE)
 
 
+def save_state_quiet(state: dict, context: str) -> bool:
+    """Persist state but never raise. Read/serve paths (status page, iPXE
+    boot) must keep working even if the filesystem is read-only; expiry is
+    re-derived from timestamps on every request anyway."""
+    try:
+        save_state(state)
+        return True
+    except OSError as e:
+        print(f"[{context}] could not persist state: {e}")
+        return False
+
+
 def prune_expired(state: dict) -> tuple[dict, list[str]]:
     now = time.time()
     expired = [mac for mac, e in state["armed"].items() if e["expires_at"] <= now]
@@ -759,8 +771,9 @@ async def api_status():
         asyncio.gather(*(arp_lookup(h["host"]) for h in hosts), return_exceptions=True),
     )
     state = load_state()
-    state, _ = prune_expired(state)
-    save_state(state)
+    state, expired = prune_expired(state)
+    if expired:
+        save_state_quiet(state, "status")
     out = []
     for h, p, hn, arp in zip(hosts, ping_r, hn_r, arp_r):
         online, latency = (False, None)
@@ -1517,14 +1530,15 @@ async def ipxe_boot(mac: str = ""):
     state, _ = prune_expired(state)
     entry = state["armed"].get(mac_n)
     if not entry:
-        save_state(state)
+        save_state_quiet(state, "ipxe")
         print(f"[ipxe] {mac_n}: not armed -> boot local")
         return PlainTextResponse(IPXE_LOCAL, media_type="text/plain")
 
     mode = entry["mode"]
-    # Consume: remove from state and allowlist (one-shot)
+    # Consume: remove from state and allowlist (one-shot). If persisting
+    # fails, still serve the boot script — the arm expires by TTL anyway.
     del state["armed"][mac_n]
-    save_state(state)
+    save_state_quiet(state, "ipxe")
     try:
         run_allowlist("remove", mac_n)
     except subprocess.CalledProcessError as e:
