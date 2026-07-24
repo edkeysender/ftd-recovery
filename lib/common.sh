@@ -162,6 +162,35 @@ template_file() {
     printf '%s' "$content" > "$dst"
 }
 
+# fstab_remove_mount <mountpoint> — remove fstab entries whose mount-point
+# field (2nd) equals <mountpoint> exactly. Matches the whole field, never a
+# substring, and refuses system mount points — so a bad or empty variable can
+# never delete the root/boot entries.
+fstab_remove_mount() {
+    local mp=$1
+    case "$mp" in
+        ""|/|/boot|/boot/*|/proc|/sys|/dev|/etc|/etc/*|/usr|/usr/*|/var|/var/*)
+            warn "fstab_remove_mount: refusing to touch entry for '${mp:-<empty>}'"
+            return 1 ;;
+    esac
+    local tmp
+    tmp=$(mktemp /etc/fstab.XXXXXX)
+    awk -v mp="$mp" '$1 ~ /^#/ || $2 != mp' /etc/fstab > "$tmp"
+    chmod 0644 "$tmp"
+    mv "$tmp" /etc/fstab
+}
+
+# fstab_require_root_entry — loudly warn if fstab has lost its root (/) entry.
+# Called at the end of anything that rewrites fstab.
+fstab_require_root_entry() {
+    if ! awk '$1 !~ /^#/ && $2 == "/" {found=1} END {exit !found}' /etc/fstab; then
+        err "/etc/fstab has NO entry for / — restore it before rebooting!"
+        err "  example: PARTUUID=<root-partuuid>  /  ext4  defaults,noatime  0  1"
+        return 1
+    fi
+    return 0
+}
+
 # RS = ASCII record-separator, safe sed delimiter (path values contain /).
 RS=$'\036'
 

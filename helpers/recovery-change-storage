@@ -53,18 +53,29 @@ if ! confirm "Proceed?" "n"; then
     echo "Aborted."; exit 0
 fi
 
+# ── Step 0: if a blank disk was chosen, partition + format it first ──────────
+# Done before touching the current storage so a failed format leaves
+# everything as it was.
+if [[ "$PICK_MODE" == "format" ]]; then
+    _erase_and_format "$PICK_DEV"
+    PICK_DEV="$FORMATTED_PART"
+fi
+
 # ── Step 1: release the bind only ────────────────────────────────────────────
 log "releasing bind mount"
-systemctl stop recovery-interface nfs-server 2>/dev/null || true
+systemctl stop recovery-interface 2>/dev/null || true
+# Give nfs-server 8 s to stop gracefully; force-kill if a client is still connected.
+timeout 8 systemctl stop nfs-server 2>/dev/null || systemctl kill nfs-server 2>/dev/null || true
 exportfs -ua 2>/dev/null || true
 
 if mountpoint -q "$STORAGE_BIND" 2>/dev/null; then
-    umount "$STORAGE_BIND" 2>/dev/null || umount -l "$STORAGE_BIND"
+    # Lazy unmount so we don't block if something still has the bind open.
+    umount -l "$STORAGE_BIND" 2>/dev/null || true
     ok "unmounted $STORAGE_BIND"
 fi
 
 # Remove only the bind fstab entry — leave the underlying device entry in place.
-sed -i "\|[[:space:]]${STORAGE_BIND}[[:space:]]|d" /etc/fstab
+fstab_remove_mount "$STORAGE_BIND"
 systemctl daemon-reload || true
 ok "bind fstab entry removed"
 
@@ -177,20 +188,32 @@ case "${underlying:-}" in
             umount "$underlying" 2>/dev/null || umount -l "$underlying"
             ok "unmounted old drive ($underlying)"
         fi
-        sed -i "\|[[:space:]]${underlying}[[:space:]]|d" /etc/fstab
+        fstab_remove_mount "$underlying"
         ;;
 esac
 
 # Move new device from temp path to the standard /mnt/ftd-backup.
 std_mnt="/mnt/ftd-backup"
 if [[ "$new_mnt" != "$std_mnt" ]]; then
-    # Remove temp bind+underlying fstab entries and replace with standard paths.
-    sed -i "\|[[:space:]]${STORAGE_BIND}[[:space:]]|d" /etc/fstab
-    sed -i "\|[[:space:]]${new_mnt}[[:space:]]|d" /etc/fstab
+    # Stop NFS while the bind is re-pointed so nothing holds the mounts open.
+    timeout 8 systemctl stop nfs-server 2>/dev/null || systemctl kill nfs-server 2>/dev/null || true
+    exportfs -ua 2>/dev/null || true
 
-    umount "$STORAGE_BIND" 2>/dev/null || true
+    # Remove temp bind+underlying fstab entries and replace with standard paths.
+    fstab_remove_mount "$STORAGE_BIND"
+    fstab_remove_mount "$new_mnt"
+
+    umount "$STORAGE_BIND" 2>/dev/null || umount -l "$STORAGE_BIND" 2>/dev/null || true
     umount "$new_mnt"      2>/dev/null || true
-    rmdir  "$new_mnt"      2>/dev/null || true
+    # Verify both are actually gone — mounting on top of a leftover would
+    # silently stack binds and leave /srv pointing somewhere unexpected.
+    if mountpoint -q "$STORAGE_BIND" 2>/dev/null; then
+        die "$STORAGE_BIND is still mounted — close anything using it and re-run"
+    fi
+    if mountpoint -q "$new_mnt" 2>/dev/null; then
+        die "$new_mnt is still mounted — close anything using it and re-run"
+    fi
+    rmdir "$new_mnt" 2>/dev/null || true
 
     mkdir -p "$std_mnt"
     echo "UUID=$new_uuid  $std_mnt  $new_fstype  defaults,noatime,nofail  0  2" >> /etc/fstab
@@ -199,8 +222,13 @@ if [[ "$new_mnt" != "$std_mnt" ]]; then
     mount "$std_mnt"      || die "final mount of $std_mnt failed"
     mount "$STORAGE_BIND" || die "final bind-mount failed"
     chmod 1777 "$STORAGE_BIND"
+
+    systemctl start nfs-server 2>/dev/null || true
+    exportfs -ra 2>/dev/null || true
     systemctl restart recovery-interface
 fi
+
+fstab_require_root_entry || true
 
 ok "storage layout finalised at $std_mnt"
 echo

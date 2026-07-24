@@ -150,7 +150,7 @@ _mode2_adopt_partition() {
     if [[ "$current_fstab_src" == "UUID=$uuid" ]]; then
         log "drive already registered in fstab"
     else
-        sed -i "\|[[:space:]]${mountpoint}[[:space:]]|d" /etc/fstab
+        fstab_remove_mount "$mountpoint"
         echo "UUID=$uuid  $mountpoint  $fstype  defaults,noatime,nofail  0  2" >> /etc/fstab
         ok "drive registered in fstab"
     fi
@@ -200,6 +200,41 @@ _disk_partition_info() {
     else
         echo "no partitions"
     fi
+}
+
+# _erase_and_format <disk> — confirm, wipe, and create GPT + ext4 on a whole
+# disk. Sets FORMATTED_PART to the new partition device on success.
+FORMATTED_PART=""
+_erase_and_format() {
+    local dev=$1
+    local size model serial
+    size=$(lsblk -dno SIZE "$dev")
+    model=$(lsblk -dno MODEL "$dev" | xargs)
+    serial=$(lsblk -dno SERIAL "$dev" | xargs)
+
+    echo
+    echo "${RED}${BOLD}WARNING: this will permanently erase all data on:${RESET}"
+    echo "  drive  : $model"
+    echo "  size   : $size"
+    echo "  device : $dev"
+    echo
+    [[ -z "$serial" ]] && die "cannot identify drive — refusing to erase without a stable identifier"
+    if ! ask_typed_match "Type ERASE to confirm" "ERASE"; then
+        die "confirmation failed — drive was not erased"
+    fi
+
+    log "partitioning and formatting $dev"
+    parted -s "$dev" mklabel gpt
+    parted -s -a optimal "$dev" mkpart primary ext4 0% 100%
+    partprobe "$dev"
+    udevadm settle
+
+    local part
+    part=$(lsblk -rnpo NAME "$dev" | awk -v d="$dev" '$1 != d {print; exit}')
+    [[ -b "$part" ]] || die "could not locate new partition on $dev"
+    log "formatting $part as ext4"
+    mkfs.ext4 -F -L ftd-backup "$part"
+    FORMATTED_PART="$part"
 }
 
 # _mode3_format_disk [device] — wipe + format a whole disk, mount, bind.
@@ -254,33 +289,8 @@ _mode3_format_disk() {
         done
     fi
 
-    local size model serial
-    size=$(lsblk -dno SIZE "$dev")
-    model=$(lsblk -dno MODEL "$dev" | xargs)
-    serial=$(lsblk -dno SERIAL "$dev" | xargs)
-
-    echo
-    echo "${RED}${BOLD}WARNING: this will permanently erase all data on:${RESET}"
-    echo "  drive  : $model"
-    echo "  size   : $size"
-    echo "  device : $dev"
-    echo
-    [[ -z "$serial" ]] && die "cannot identify drive — refusing to erase without a stable identifier"
-    if ! ask_typed_match "Type ERASE to confirm" "ERASE"; then
-        die "confirmation failed — drive was not erased"
-    fi
-
-    log "partitioning and formatting $dev"
-    parted -s "$dev" mklabel gpt
-    parted -s -a optimal "$dev" mkpart primary ext4 0% 100%
-    partprobe "$dev"
-    udevadm settle
-
-    local part
-    part=$(lsblk -rnpo NAME "$dev" | awk -v d="$dev" '$1 != d {print; exit}')
-    [[ -b "$part" ]] || die "could not locate new partition on $dev"
-    log "formatting $part as ext4"
-    mkfs.ext4 -F -L ftd-backup "$part"
+    _erase_and_format "$dev"
+    local part="$FORMATTED_PART"
 
     local uuid
     uuid=$(blkid -s UUID -o value "$part")
@@ -293,7 +303,7 @@ _mode3_format_disk() {
     local current_fstab_src
     current_fstab_src=$(awk -v mp="$mountpoint" '$2 == mp && $1 !~ /^#/ {print $1; exit}' /etc/fstab || true)
     if [[ "$current_fstab_src" != "UUID=$uuid" ]]; then
-        sed -i "\|[[:space:]]${mountpoint}[[:space:]]|d" /etc/fstab
+        fstab_remove_mount "$mountpoint"
         echo "UUID=$uuid  $mountpoint  ext4  defaults,noatime,nofail  0  2" >> /etc/fstab
     fi
     systemctl daemon-reload || true
@@ -323,7 +333,7 @@ _setup_bind_mount() {
         ok "added bind-mount fstab entry"
     elif [[ "$current_src" != "$src" ]]; then
         # Storage device changed — replace the old entry and remount.
-        sed -i "\|[[:space:]]${STORAGE_BIND}[[:space:]]|d" /etc/fstab
+        fstab_remove_mount "$STORAGE_BIND"
         echo "$fstab_line" >> /etc/fstab
         ok "updated bind-mount: $current_src → $src"
         # Unmount the stale bind so we remount from the new source below.
