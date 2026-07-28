@@ -92,15 +92,17 @@ if command -v swanctl &>/dev/null; then
     systemctl disable --now strongswan-starter.service 2>/dev/null || true
     systemctl mask strongswan-swanctl.service 2>/dev/null || true
     vpn_ok=0
+    # charon needs a moment to open its vici socket after start — retry.
+    _swan_ready() { local i; for i in $(seq 1 12); do swanctl --stats &>/dev/null && return 0; sleep 1; done; return 1; }
     if systemctl is-active --quiet strongswan.service || systemctl is-active --quiet ipsec.service; then
         # Daemon already up (e.g. this very update is running over the VPN) —
         # don't disturb it, just probe.
-        swanctl --stats &>/dev/null && vpn_ok=1
+        _swan_ready && vpn_ok=1
     else
         for svc in strongswan.service ipsec.service; do
             systemctl cat "$svc" &>/dev/null || continue
             systemctl start "$svc" 2>/dev/null || true
-            swanctl --stats &>/dev/null && vpn_ok=1
+            _swan_ready && vpn_ok=1
             systemctl stop "$svc" 2>/dev/null || true
             break
         done
