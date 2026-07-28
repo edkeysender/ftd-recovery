@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # FTD Recovery installer.
 # Usage: sudo ./install.sh [--prefix PATH] [--user NAME] [--interface IF] [--server-ip IP]
-#   or:  curl -fsSL https://github.com/edkeysender/ftd-recovery/raw/main/install.sh | sudo bash
+#   or:  curl -fsSL http://gitlab.ftdinternal.aero/ftd-supp/ftd_recovery/-/raw/main/install.sh | sudo bash
 #
 # Default install prefix: /ftd/product/FTDRecovery
 # Default service user:   ftd
@@ -12,11 +12,17 @@ set -euo pipefail
 # need to source don't exist on disk — bootstrap by fetching the repo tarball
 # and re-execing this installer from there.
 if [[ -z "${BASH_SOURCE[0]:-}" || ! -f "${BASH_SOURCE[0]:-}" ]]; then
-    REPO_URL="${FTD_RECOVERY_REPO_URL:-https://github.com/edkeysender/ftd-recovery}"
+    REPO_URL="${FTD_RECOVERY_REPO_URL:-http://gitlab.ftdinternal.aero/ftd-supp/ftd_recovery}"
     REPO_REF="${FTD_RECOVERY_REPO_REF:-main}"
+    if [[ "$REPO_URL" == *github.com* ]]; then
+        ARCHIVE_URL="$REPO_URL/archive/refs/heads/$REPO_REF.tar.gz"
+    else
+        # GitLab archive URL format
+        ARCHIVE_URL="$REPO_URL/-/archive/$REPO_REF/ftd-recovery-$REPO_REF.tar.gz"
+    fi
     BOOTSTRAP_DIR="$(mktemp -d -t ftd-recovery-XXXXXX)"
     echo "Fetching $REPO_URL @ $REPO_REF → $BOOTSTRAP_DIR"
-    curl -fsSL "$REPO_URL/archive/refs/heads/$REPO_REF.tar.gz" \
+    curl -fsSL "$ARCHIVE_URL" \
         | tar -xz -C "$BOOTSTRAP_DIR" --strip-components=1
     exec bash "$BOOTSTRAP_DIR/install.sh" "$@"
 fi
@@ -72,11 +78,14 @@ export DEBIAN_FRONTEND=noninteractive
     parted e2fsprogs \
     curl wget ca-certificates \
     isc-dhcp-common smartmontools \
+    git strongswan xl2tpd ppp \
     >/dev/null ) &
 _spin $!
 wait $!
 # tftpd-hpa is installed for the tftp-hpa user/group; we still let dnsmasq serve TFTP.
 systemctl disable --now tftpd-hpa 2>/dev/null || true
+# VPN daemons are brought up on demand by recovery-update, not at boot.
+systemctl disable --now xl2tpd strongswan-starter 2>/dev/null || true
 ok "system packages installed"
 
 # ── Step 2: network detection ───────────────────────────────────────────────
@@ -217,6 +226,13 @@ install -m 0755 "$SCRIPT_DIR/helpers/recovery-allowlist"     /usr/local/bin/reco
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-rmimage"       /usr/local/bin/recovery-rmimage
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-remount"       /usr/local/bin/recovery-remount
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-change-storage" /usr/local/bin/recovery-change-storage
+install -m 0755 "$SCRIPT_DIR/helpers/recovery-update"        /usr/local/bin/recovery-update
+
+# Self-update config (holds VPN PSK / deploy token) — seed once, never clobber.
+mkdir -p /etc/ftd-recovery
+install -m 0600 "$SCRIPT_DIR/etc/update.conf.example" /etc/ftd-recovery/update.conf.example
+[[ -f /etc/ftd-recovery/update.conf ]] \
+    || install -m 0600 "$SCRIPT_DIR/etc/update.conf.example" /etc/ftd-recovery/update.conf
 
 for f in ftd-grubcfg ftd-rmimage recovery-interface; do
     # Rewrite the leading user token to whatever SERVICE_USER is.

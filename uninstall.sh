@@ -4,18 +4,23 @@
 # Pass --purge-storage to also unmount and remove the bind mount + fstab entries.
 #
 # Usage: sudo ./uninstall.sh [--purge-storage]
-#   or:  curl -fsSL https://github.com/edkeysender/ftd-recovery/raw/main/uninstall.sh | sudo bash
+#   or:  curl -fsSL http://gitlab.ftdinternal.aero/ftd-supp/ftd_recovery/-/raw/main/uninstall.sh | sudo bash
 
 set -euo pipefail
 
 # When piped through `curl | bash`, BASH_SOURCE is empty and lib/common.sh
 # isn't on disk — bootstrap by fetching the repo tarball and re-execing.
 if [[ -z "${BASH_SOURCE[0]:-}" || ! -f "${BASH_SOURCE[0]:-}" ]]; then
-    REPO_URL="${FTD_RECOVERY_REPO_URL:-https://github.com/edkeysender/ftd-recovery}"
+    REPO_URL="${FTD_RECOVERY_REPO_URL:-http://gitlab.ftdinternal.aero/ftd-supp/ftd_recovery}"
     REPO_REF="${FTD_RECOVERY_REPO_REF:-main}"
+    if [[ "$REPO_URL" == *github.com* ]]; then
+        ARCHIVE_URL="$REPO_URL/archive/refs/heads/$REPO_REF.tar.gz"
+    else
+        ARCHIVE_URL="$REPO_URL/-/archive/$REPO_REF/ftd-recovery-$REPO_REF.tar.gz"
+    fi
     BOOTSTRAP_DIR="$(mktemp -d -t ftd-recovery-XXXXXX)"
     echo "Fetching $REPO_URL @ $REPO_REF → $BOOTSTRAP_DIR"
-    curl -fsSL "$REPO_URL/archive/refs/heads/$REPO_REF.tar.gz" \
+    curl -fsSL "$ARCHIVE_URL" \
         | tar -xz -C "$BOOTSTRAP_DIR" --strip-components=1
     exec bash "$BOOTSTRAP_DIR/uninstall.sh" "$@"
 fi
@@ -47,9 +52,11 @@ systemctl daemon-reload
 
 log "removing helpers and sudoers"
 rm -f /usr/local/bin/recovery-grubcfg /usr/local/bin/recovery-allowlist /usr/local/bin/recovery-rmimage \
-      /usr/local/bin/recovery-remount /usr/local/bin/recovery-change-storage
+      /usr/local/bin/recovery-remount /usr/local/bin/recovery-change-storage /usr/local/bin/recovery-update
 rm -f /etc/sudoers.d/ftd-grubcfg /etc/sudoers.d/ftd-rmimage /etc/sudoers.d/recovery-interface
 rm -rf /usr/local/lib/ftd-recovery
+# Leave /etc/ftd-recovery/update.conf in place — it holds the VPN PSK/token
+# and is re-used on reinstall. Remove by hand if decommissioning the device.
 
 log "removing dnsmasq + NFS config"
 rm -f /etc/dnsmasq.d/clonezilla-pxe.conf

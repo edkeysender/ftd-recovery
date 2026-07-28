@@ -6,14 +6,14 @@ FastAPI web UI running on a Raspberry Pi.
 ## One-line install
 
 ```bash
-curl -fsSL https://github.com/edkeysender/ftd-recovery/raw/main/install.sh | sudo bash
+curl -fsSL http://gitlab.ftdinternal.aero/ftd-supp/ftd_recovery/-/raw/main/install.sh | sudo bash
 ```
 
 Or, if cloning the repo:
 
 ```bash
-git clone https://github.com/edkeysender/ftd-recovery.git
-cd ftd-recovery
+git clone http://gitlab.ftdinternal.aero/ftd-supp/ftd_recovery.git
+cd ftd_recovery
 sudo ./install.sh
 ```
 
@@ -30,7 +30,7 @@ Override with `--prefix`, `--user`, `--interface`, `--server-ip`, `--subnet`.
 | TFTP + proxy-DHCP | dnsmasq | Hands PXE clients `grubnetx64.efi` |
 | Boot chain | `/srv/tftp/{grubnetx64.efi, debian-installer/amd64/grub/grub.cfg, clonezilla/*}` | GRUB → Clonezilla live |
 | NFS image store | `/srv/clonezilla-images` (bind) | Clients mount this to read/write images |
-| Helper scripts | `/usr/local/bin/recovery-{grubcfg,allowlist,rmimage,remount,change-storage}` | Privileged ops via sudo NOPASSWD |
+| Helper scripts | `/usr/local/bin/recovery-{grubcfg,allowlist,rmimage,remount,change-storage,update}` | Privileged ops via sudo NOPASSWD |
 | Sudoers | `/etc/sudoers.d/{ftd-grubcfg,ftd-rmimage,recovery-interface}` | Lets service user invoke helpers |
 
 ## Storage layout (chosen interactively at install)
@@ -72,10 +72,29 @@ curl -s http://<server-ip>:8088/api/version
 
 ## Updating an existing installation
 
-Run on each Pi to pull the latest app, helpers, and sudoers from the repo:
+### From the web UI (recommended)
+
+Click **Update** in the header of the web interface. The Pi pulls the
+configured ref from the internal GitLab and runs the updater; progress and the
+log stream live in the dialog, and the interface reloads itself when done.
+
+Devices **outside the company network** connect through the company VPN
+(L2TP/IPsec) for the duration of the update and disconnect right after. The
+dialog asks for the operator's VPN username/password — they are used once, held
+in RAM only, and never stored. The tunnel is split: only GitLab's address is
+routed through it, so PXE/NFS service on the local network is not interrupted.
+Devices inside the company network leave the credential fields empty.
+
+Per-device settings (VPN gateway, preshared key, GitLab IP, optional read-only
+deploy token) live in `/etc/ftd-recovery/update.conf` (root-only, seeded from
+`etc/update.conf.example` on first update).
+
+### From the command line
+
+Run on the Pi to pull the latest app, helpers, and sudoers from the repo:
 
 ```bash
-curl -fsSL https://github.com/edkeysender/ftd-recovery/raw/main/update.sh | sudo bash
+curl -fsSL http://gitlab.ftdinternal.aero/ftd-supp/ftd_recovery/-/raw/main/update.sh | sudo bash
 ```
 
 The updater auto-detects the install prefix from the running service, installs
@@ -96,9 +115,9 @@ showmount -e localhost
 One-line (same self-bootstrap as the installer):
 
 ```bash
-curl -fsSL https://github.com/edkeysender/ftd-recovery/raw/main/uninstall.sh | sudo bash
+curl -fsSL http://gitlab.ftdinternal.aero/ftd-supp/ftd_recovery/-/raw/main/uninstall.sh | sudo bash
 # or with storage purge:
-curl -fsSL https://github.com/edkeysender/ftd-recovery/raw/main/uninstall.sh | sudo bash -s -- --purge-storage
+curl -fsSL http://gitlab.ftdinternal.aero/ftd-supp/ftd_recovery/-/raw/main/uninstall.sh | sudo bash -s -- --purge-storage
 ```
 
 From a clone:

@@ -809,6 +809,65 @@ async def api_drive_health():
     return await loop.run_in_executor(None, get_drive_health)
 
 
+UPDATE_HELPER = "/usr/local/bin/recovery-update"
+UPDATE_RUN_DIR = Path("/run/ftd-recovery-update")
+
+
+class UpdateStart(BaseModel):
+    username: str = ""
+    password: str = ""
+
+
+@app.post("/api/update")
+async def api_update_start(payload: UpdateStart):
+    if "\n" in payload.username or "\r" in payload.username:
+        raise HTTPException(status_code=400, detail="invalid username")
+    # Credentials go to the root helper over stdin (never argv, never disk);
+    # the helper keeps them in RAM only while the VPN authenticates.
+    creds = f"{payload.username}\n{payload.password}\n"
+    try:
+        proc = subprocess.run(
+            ["sudo", "-n", UPDATE_HELPER, "start"],
+            input=creds, capture_output=True, text=True, timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500, detail="update helper timed out")
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="sudo not available")
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "failed to start update").strip()
+        raise HTTPException(status_code=500, detail=msg[:300])
+    return {"started": True}
+
+
+@app.post("/api/update/abort")
+async def api_update_abort():
+    proc = subprocess.run(
+        ["sudo", "-n", UPDATE_HELPER, "abort"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "abort failed").strip()
+        raise HTTPException(status_code=500, detail=msg[:300])
+    return {"aborted": True}
+
+
+@app.get("/api/update/status")
+async def api_update_status():
+    status = {"state": "idle"}
+    try:
+        status = json.loads((UPDATE_RUN_DIR / "status.json").read_text())
+    except (OSError, ValueError):
+        pass
+    log_tail = ""
+    try:
+        lines = (UPDATE_RUN_DIR / "update.log").read_text(errors="replace").splitlines()
+        log_tail = "\n".join(lines[-150:])
+    except OSError:
+        pass
+    return {"status": status, "log": log_tail, "version": VERSION}
+
+
 @app.get("/api/version")
 async def api_version():
     return {"version": VERSION}
@@ -1663,6 +1722,15 @@ INDEX_HTML = """<!doctype html>
   .addDevices-row .info .name input { background:transparent; color:#ddd; border:1px solid transparent; padding:2px 4px; border-radius:3px; font:inherit; width:100%; max-width:260px; }
   .addDevices-row .info .name input:hover { border-color:#333; }
   .addDevices-row .info .name input:focus { outline:none; border-color:#3b82f6; background:#1a1a1a; }
+  .upd-note { font-size:12px; color:#888; line-height:1.5; margin:0 0 14px; }
+  .upd-label { display:block; font-size:12px; color:#aaa; margin-bottom:10px; }
+  .upd-label input { display:block; width:100%; box-sizing:border-box; margin-top:4px; background:#1a1a1a; color:#ddd; border:1px solid #333; border-radius:4px; padding:7px 9px; font:inherit; font-size:13px; }
+  .upd-label input:focus { outline:none; border-color:#3b82f6; }
+  #updateLog { background:#0c0c0c; border:1px solid #2a2a2a; border-radius:5px; padding:10px 12px; margin:0 0 14px; max-height:45vh; min-height:120px; overflow:auto; font-family: ui-monospace, monospace; font-size:12px; line-height:1.5; color:#bbb; white-space:pre-wrap; word-break:break-word; }
+  .upd-state { font-size:12px; margin:0 0 10px; padding:6px 10px; border-radius:5px; display:none; }
+  .upd-state.running { display:block; background:rgba(31,111,235,0.10); border:1px solid rgba(31,111,235,0.4); color:#79b8ff; }
+  .upd-state.ok      { display:block; background:rgba(63,185,80,0.10); border:1px solid rgba(63,185,80,0.35); color:#3fb950; }
+  .upd-state.err     { display:block; background:rgba(248,81,73,0.10); border:1px solid rgba(248,81,73,0.40); color:#f0857c; }
 </style>
 </head>
 <body>
@@ -1672,7 +1740,10 @@ INDEX_HTML = """<!doctype html>
       <h1>Recovery Status</h1>
       <div class="sub" id="meta">Loading…</div>
     </div>
-    <button class="scan" id="addDevicesBtn">+ Add backup devices</button>
+    <div style="display:flex; gap:8px;">
+      <button class="scan" id="updateBtn">Update</button>
+      <button class="scan" id="addDevicesBtn">+ Add backup devices</button>
+    </div>
   </div>
   <div class="banner" id="storageBanner"></div>
   <div class="banner" id="warnBanner"></div>
@@ -1700,6 +1771,34 @@ INDEX_HTML = """<!doctype html>
       <div class="row">
         <button id="addDevicesCancel">Cancel</button>
         <button id="addDevicesConfirm" class="primary" disabled>Add selected</button>
+      </div>
+    </div>
+  </div>
+  <div class="modal-bg" id="updateModal">
+    <div class="modal">
+      <h2>Software update</h2>
+      <div class="sub" id="updateSub">Pulls the latest version from the FTD GitLab and installs it.</div>
+      <div id="updateForm">
+        <p class="upd-note">
+          Devices outside the company network connect through the company VPN
+          (L2TP/IPsec) for the duration of the update and disconnect right
+          after. Your credentials are used once for that connection and are
+          never stored. Inside the company network the fields can be left
+          empty.
+        </p>
+        <label class="upd-label">VPN username
+          <input type="text" id="vpnUser" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="upd-label">VPN password
+          <input type="password" id="vpnPass" autocomplete="off">
+        </label>
+      </div>
+      <div class="upd-state" id="updateState"></div>
+      <pre id="updateLog" style="display:none"></pre>
+      <div class="row">
+        <button id="updateAbort" style="display:none">Abort update</button>
+        <button id="updateClose">Close</button>
+        <button id="updateStartBtn" class="primary">Start update</button>
       </div>
     </div>
   </div>
@@ -2213,6 +2312,121 @@ async function openAddDevicesPicker(btn) {
 }
 
 document.getElementById('addDevicesBtn').addEventListener('click', e => openAddDevicesPicker(e.currentTarget));
+
+// ── Software update ────────────────────────────────────────────────────────
+const updModal = document.getElementById('updateModal');
+const updForm  = document.getElementById('updateForm');
+const updLog   = document.getElementById('updateLog');
+const updState = document.getElementById('updateState');
+const updStart = document.getElementById('updateStartBtn');
+const updAbort = document.getElementById('updateAbort');
+let updTimer = null;
+let updWasRunning = false;
+
+function updSetView(mode) {  // 'form' | 'log'
+  updForm.style.display  = mode === 'form' ? '' : 'none';
+  updLog.style.display   = mode === 'log'  ? '' : 'none';
+  updStart.style.display = mode === 'form' ? '' : 'none';
+  updAbort.style.display = mode === 'log'  ? '' : 'none';
+}
+
+function updStopPolling() {
+  if (updTimer) { clearInterval(updTimer); updTimer = null; }
+}
+
+async function updPoll() {
+  let d;
+  try {
+    const r = await fetch('/api/update/status', { cache: 'no-store' });
+    d = await r.json();
+  } catch (e) {
+    // The interface restarts while update.sh runs — keep polling until it's back.
+    updState.className = 'upd-state running';
+    updState.textContent = 'Interface restarting — waiting for it to come back…';
+    return;
+  }
+  const s = d.status || {};
+  const atBottom = updLog.scrollTop + updLog.clientHeight >= updLog.scrollHeight - 8;
+  updLog.textContent = d.log || '';
+  if (atBottom) updLog.scrollTop = updLog.scrollHeight;
+  if (s.state === 'running') {
+    updWasRunning = true;
+    updState.className = 'upd-state running';
+    updState.textContent = (s.message || s.step || 'running') + '…';
+  } else if (s.state === 'success' && updWasRunning) {
+    updStopPolling();
+    updAbort.style.display = 'none';
+    updState.className = 'upd-state ok';
+    updState.textContent = (s.message || 'Update complete') + ' — reloading…';
+    setTimeout(() => location.reload(), 2500);
+  } else if (s.state === 'failed' && updWasRunning) {
+    updStopPolling();
+    updAbort.style.display = 'none';
+    updState.className = 'upd-state err';
+    updState.textContent = s.message || 'Update failed — see log';
+  }
+}
+
+function openUpdateModal() {
+  updModal.classList.add('show');
+  updState.className = 'upd-state';
+  fetch('/api/update/status', { cache: 'no-store' }).then(r => r.json()).then(d => {
+    if (d.status && d.status.state === 'running') {
+      updWasRunning = true;
+      updSetView('log');
+      updPoll();
+      if (!updTimer) updTimer = setInterval(updPoll, 2000);
+    } else {
+      updWasRunning = false;
+      updSetView('form');
+    }
+  }).catch(() => { updWasRunning = false; updSetView('form'); });
+}
+
+function updCloseModal() {
+  updStopPolling();
+  updModal.classList.remove('show');
+}
+
+updStart.addEventListener('click', async () => {
+  updStart.disabled = true;
+  const username = document.getElementById('vpnUser').value;
+  const password = document.getElementById('vpnPass').value;
+  try {
+    const r = await fetch('/api/update', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({username, password})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'failed to start update');
+    document.getElementById('vpnPass').value = '';
+    updWasRunning = true;
+    updLog.textContent = '';
+    updSetView('log');
+    updState.className = 'upd-state running';
+    updState.textContent = 'Starting update…';
+    if (!updTimer) updTimer = setInterval(updPoll, 2000);
+  } catch (e) {
+    toast('Error: ' + e.message, 'err');
+  } finally { updStart.disabled = false; }
+});
+
+updAbort.addEventListener('click', async () => {
+  if (!window.confirm('Abort the running update and disconnect the VPN?')) return;
+  updAbort.disabled = true;
+  try {
+    const r = await fetch('/api/update/abort', { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'abort failed');
+    toast('Update aborted', 'ok');
+  } catch (e) { toast('Error: ' + e.message, 'err'); }
+  finally { updAbort.disabled = false; }
+});
+
+document.getElementById('updateClose').addEventListener('click', updCloseModal);
+updModal.addEventListener('click', e => { if (e.target === updModal) updCloseModal(); });
+document.getElementById('updateBtn').addEventListener('click', openUpdateModal);
 
 async function refreshBackups() {
   try {

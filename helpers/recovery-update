@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# FTD Recovery self-update orchestrator.
+#
+# Pulls the configured ref from the internal GitLab and runs update.sh from
+# it. Devices inside the company network reach GitLab directly; devices in
+# the field connect through an on-demand L2TP/IPsec tunnel (strongswan +
+# xl2tpd, preshared key from update.conf). The operator's VPN username and
+# password arrive on stdin, live only in RAM (/dev/shm) while the link
+# authenticates, and the tunnel is torn down as soon as the update ends —
+# success, failure, or abort.
+#
+# Split tunnel: pppd is run without 'defaultroute' or 'usepeerdns', and the
+# only route added is a /32 to GitLab — the Pi keeps serving PXE/NFS/DHCP on
+# the local network throughout.
+#
+# The job itself runs as a transient systemd unit so it survives the
+# recovery-interface restart that update.sh performs.
+#
+# Usage:
+#   recovery-update start   # creds on stdin (line 1 username, line 2
+#                           # password; both may be empty inside the network)
+#   recovery-update run     # the detached job (invoked via systemd-run)
+#   recovery-update abort   # stop a running update and tear the tunnel down
+#
+# Config: /etc/ftd-recovery/update.conf
+set -euo pipefail
+umask 022
+
+CONF="/etc/ftd-recovery/update.conf"
+RUN_DIR="/run/ftd-recovery-update"
+LOG="$RUN_DIR/update.log"
+STATUS="$RUN_DIR/status.json"
+CREDS="/dev/shm/ftd-update-creds"
+PPP_OPTS="/dev/shm/ftd-update-ppp-options"
+UNIT="ftd-recovery-update"
+HOSTS_MARK="# ftd-recovery-update"
+L2TP_CONN="ftd-update"
+L2TP_CONTROL="/var/run/xl2tpd/l2tp-control"
+
+# Defaults — override in $CONF.
+GITLAB_URL="http://gitlab.ftdinternal.aero/ftd-supp/ftd_recovery"
+GITLAB_HOST=""
+GITLAB_IP=""
+VPN_GATEWAY=""
+VPN_PSK=""
+VPN_TIMEOUT=90
+VPN_IKE="aes256-sha2_256-modp2048,aes256-sha1-modp2048,aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024"
+VPN_ESP="aes256-sha2_256,aes256-sha1,aes128-sha1,3des-sha1"
+REPO_REF="main"
+GITLAB_TOKEN_USER=""
+GITLAB_TOKEN=""
+
+# shellcheck source=/dev/null
+[[ -f "$CONF" ]] && source "$CONF"
+[[ -n "$GITLAB_HOST" ]] || GITLAB_HOST=$(sed -E 's|^[a-z]+://([^/:]+).*|\1|' <<<"$GITLAB_URL")
+
+[[ $EUID -eq 0 ]] || { echo "recovery-update: must run as root" >&2; exit 1; }
+
+logu() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >> "$LOG"; }
+
+# set_status <state> <step> [message] — state: running|success|failed
+set_status() {
+    local state=$1 step=$2 msg=${3:-}
+    printf '{"state":"%s","step":"%s","message":"%s","ts":%s}\n' \
+        "$state" "$step" "${msg//\"/\\\"}" "$(date +%s)" > "$STATUS.tmp"
+    mv "$STATUS.tmp" "$STATUS"
+}
+
+fail() {  # fail <step> <message-for-status> [extra log lines already written]
+    local step=$1 msg=$2
+    logu "ERROR: $msg"
+    set_status failed "$step" "$msg"
+    exit 1
+}
+
+# Any HTTP response counts as reachable — auth errors still prove the network
+# path is up. Connection refused / timeout / DNS failure do not.
+gitlab_reachable() {
+    curl -sS -m 8 -o /dev/null "$GITLAB_URL" 2>/dev/null
+}
+
+vpn_diag() {  # append recent VPN daemon logs to the update log
+    journalctl -n 20 --no-pager -t pppd -t xl2tpd -t charon >> "$LOG" 2>/dev/null || true
+}
+
+WORK=""
+PPP_IF=""
+teardown_done=0
+teardown() {
+    [[ $teardown_done -eq 1 ]] && return 0
+    teardown_done=1
+    rm -f "$CREDS" "$PPP_OPTS"
+    if [[ -e "$L2TP_CONTROL" ]]; then
+        logu "disconnecting VPN"
+        echo "d $L2TP_CONN" > "$L2TP_CONTROL" 2>/dev/null || true
+        sleep 1
+    fi
+    systemctl stop xl2tpd 2>/dev/null || true
+    ipsec down "$L2TP_CONN" 2>/dev/null || true
+    systemctl stop strongswan-starter 2>/dev/null \
+        || systemctl stop strongswan 2>/dev/null || true
+    [[ -n "$GITLAB_IP" ]] && ip route del "$GITLAB_IP/32" 2>/dev/null || true
+    sed -i "\|${HOSTS_MARK}\$|d" /etc/hosts 2>/dev/null || true
+    [[ -n "$WORK" ]] && rm -rf "$WORK"
+    return 0
+}
+
+vpn_connect() {
+    set_status running vpn "connecting VPN (L2TP/IPsec)"
+    local bin
+    for bin in ipsec xl2tpd pppd; do
+        command -v "$bin" >/dev/null 2>&1 \
+            || fail vpn "$bin is not installed — run update.sh once with internet access"
+    done
+    [[ -n "$VPN_GATEWAY" ]] || fail vpn "VPN_GATEWAY not set in $CONF"
+    [[ -n "$VPN_PSK" ]]     || fail vpn "VPN_PSK not set in $CONF"
+    [[ -n "$GITLAB_IP" ]]   || fail vpn "GITLAB_IP not set in $CONF — required to route GitLab through the tunnel"
+    [[ -s "$CREDS" ]]       || fail vpn "device is outside the company network — VPN credentials required"
+
+    local vpn_user vpn_pass
+    vpn_user=$(sed -n 1p "$CREDS")
+    vpn_pass=$(sed -n 2p "$CREDS")
+    [[ -n "$vpn_user" && -n "$vpn_pass" ]] || fail vpn "VPN credentials required"
+
+    # IPsec transport to the gateway (IKEv1 + PSK, the L2TP/IPsec standard).
+    cat > /etc/ipsec.conf <<EOF
+# Written by recovery-update — regenerated on every update run.
+config setup
+
+conn $L2TP_CONN
+    auto=add
+    keyexchange=ikev1
+    authby=secret
+    type=transport
+    left=%defaultroute
+    leftprotoport=17/1701
+    right=$VPN_GATEWAY
+    rightprotoport=17/1701
+    ike=$VPN_IKE!
+    esp=$VPN_ESP!
+EOF
+    ( umask 077; cat > /etc/ipsec.secrets <<EOF
+# Written by recovery-update — regenerated on every update run.
+%any %any : PSK "$VPN_PSK"
+EOF
+    )
+
+    # L2TP over the IPsec transport; ppp options live in RAM only because
+    # they carry the operator's credentials.
+    cat > /etc/xl2tpd/xl2tpd.conf <<EOF
+; Written by recovery-update — regenerated on every update run.
+[global]
+port = 1701
+
+[lac $L2TP_CONN]
+lns = $VPN_GATEWAY
+ppp debug = no
+pppoptfile = $PPP_OPTS
+length bit = yes
+redial = no
+EOF
+    ( umask 077; cat > "$PPP_OPTS" <<EOF
+ipcp-accept-local
+ipcp-accept-remote
+refuse-eap
+noccp
+noauth
+mtu 1280
+mru 1280
+noipdefault
+connect-delay 5000
+name "$vpn_user"
+password "$vpn_pass"
+EOF
+    )
+    rm -f "$CREDS"
+
+    local before_ppp
+    before_ppp=$(ls /sys/class/net 2>/dev/null | grep '^ppp' | sort | tr '\n' ' ')
+
+    logu "starting IPsec to $VPN_GATEWAY"
+    systemctl restart strongswan-starter 2>/dev/null \
+        || systemctl restart strongswan 2>/dev/null \
+        || fail vpn "could not start strongswan"
+    local waited=0
+    until ipsec status >/dev/null 2>&1; do
+        sleep 1; waited=$((waited + 1))
+        (( waited >= 15 )) && fail vpn "IPsec daemon did not come up"
+    done
+    if ! ipsec up "$L2TP_CONN" >> "$LOG" 2>&1; then
+        vpn_diag
+        fail vpn "IPsec negotiation with $VPN_GATEWAY failed — check VPN_GATEWAY/VPN_PSK"
+    fi
+
+    logu "starting L2TP session"
+    systemctl restart xl2tpd 2>/dev/null || fail vpn "could not start xl2tpd"
+    waited=0
+    until [[ -e "$L2TP_CONTROL" ]]; do
+        sleep 1; waited=$((waited + 1))
+        (( waited >= 15 )) && { vpn_diag; fail vpn "xl2tpd control socket did not appear"; }
+    done
+    echo "c $L2TP_CONN" > "$L2TP_CONTROL"
+
+    # Wait for the ppp interface to come up with an address.
+    logu "waiting for PPP link (timeout ${VPN_TIMEOUT}s)"
+    waited=0
+    PPP_IF=""
+    while [[ -z "$PPP_IF" ]]; do
+        local cand
+        for cand in $(ls /sys/class/net 2>/dev/null | grep '^ppp' || true); do
+            if [[ " $before_ppp " != *" $cand "* ]] \
+                    && ip -4 -o addr show dev "$cand" 2>/dev/null | grep -q inet; then
+                PPP_IF=$cand
+                break
+            fi
+        done
+        [[ -n "$PPP_IF" ]] && break
+        sleep 3; waited=$((waited + 3))
+        if (( waited >= VPN_TIMEOUT )); then
+            vpn_diag
+            fail vpn "PPP link did not come up in ${VPN_TIMEOUT}s — likely wrong credentials"
+        fi
+    done
+    rm -f "$PPP_OPTS"
+    logu "PPP link up on $PPP_IF"
+
+    # Split tunnel: route only GitLab through the link, pin its hostname.
+    ip route replace "$GITLAB_IP/32" dev "$PPP_IF"
+    sed -i "\|${HOSTS_MARK}\$|d" /etc/hosts
+    echo "$GITLAB_IP $GITLAB_HOST $HOSTS_MARK" >> /etc/hosts
+
+    logu "waiting for GitLab over the tunnel"
+    waited=0
+    until gitlab_reachable; do
+        sleep 3; waited=$((waited + 3))
+        if (( waited >= 30 )); then
+            vpn_diag
+            fail vpn "tunnel is up but GitLab is not answering at $GITLAB_IP"
+        fi
+    done
+    logu "VPN up — GitLab reachable"
+}
+
+fetch_repo() {
+    set_status running download "fetching latest release from GitLab"
+    WORK=$(mktemp -d -t ftd-update-XXXXXX)
+    local askpass=""
+    local -a git_env=("GIT_TERMINAL_PROMPT=0")
+    if [[ -n "$GITLAB_TOKEN" ]]; then
+        askpass=$(mktemp -p /dev/shm ftd-askpass-XXXXXX)
+        chmod 0700 "$askpass"
+        cat > "$askpass" <<EOF
+#!/bin/sh
+case "\$1" in
+    Username*) printf '%s\n' '$GITLAB_TOKEN_USER' ;;
+    *)         printf '%s\n' '$GITLAB_TOKEN' ;;
+esac
+EOF
+        git_env+=("GIT_ASKPASS=$askpass")
+    fi
+    logu "cloning $GITLAB_URL.git (ref: $REPO_REF)"
+    if ! env "${git_env[@]}" git clone --quiet --depth 1 \
+            --branch "$REPO_REF" "$GITLAB_URL.git" "$WORK/repo" >>"$LOG" 2>&1; then
+        rm -f "$askpass"
+        fail download "git clone from GitLab failed — see log"
+    fi
+    rm -f "$askpass"
+}
+
+cmd_start() {
+    if systemctl is-active --quiet "$UNIT"; then
+        echo "an update is already running" >&2
+        exit 1
+    fi
+    mkdir -p "$RUN_DIR"
+    chmod 0755 "$RUN_DIR"
+    : > "$LOG"; chmod 0644 "$LOG"
+    # Stash credentials in RAM only (line 1 username, line 2 password).
+    rm -f "$CREDS"
+    ( umask 077; head -n 2 > "$CREDS" )
+    set_status running preparing "starting update job"
+    chmod 0644 "$STATUS"
+    systemd-run --unit "$UNIT" --collect --quiet "$0" run
+    echo "update started"
+}
+
+cmd_run() {
+    mkdir -p "$RUN_DIR"
+    trap teardown EXIT
+    trap 'logu "update aborted"; set_status failed aborted "update aborted"; teardown; exit 143' TERM INT
+    logu "FTD Recovery update starting"
+
+    # A read-only root filesystem would leave update.sh half-applied.
+    set_status running precheck "checking filesystem is writable"
+    if ! { : > /usr/local/.ftd-update-rw-test; } 2>/dev/null; then
+        fail precheck "root filesystem is read-only — fix mounts before updating"
+    fi
+    rm -f /usr/local/.ftd-update-rw-test
+
+    set_status running reachability "checking direct connection to GitLab"
+    local used_vpn=0
+    if gitlab_reachable; then
+        logu "GitLab reachable directly — no VPN needed"
+        rm -f "$CREDS"
+    else
+        logu "GitLab not reachable directly — bringing up VPN"
+        used_vpn=1
+        vpn_connect
+    fi
+
+    fetch_repo
+
+    set_status running install "running update.sh"
+    logu "running update.sh"
+    if ! bash "$WORK/repo/update.sh" --ref "$REPO_REF" >>"$LOG" 2>&1; then
+        fail install "update.sh failed — see log"
+    fi
+
+    if [[ $used_vpn -eq 1 ]]; then
+        set_status running disconnect "update installed — disconnecting VPN"
+    fi
+    local new_version
+    new_version=$(cat "$WORK/repo/VERSION" 2>/dev/null || echo "?")
+    teardown
+    logu "update complete — now at version $new_version"
+    set_status success done "updated to version $new_version"
+}
+
+cmd_abort() {
+    if systemctl is-active --quiet "$UNIT"; then
+        systemctl stop "$UNIT"
+        mkdir -p "$RUN_DIR"
+        set_status failed aborted "update aborted"
+        echo "update aborted"
+    else
+        echo "no update running"
+    fi
+    # Belt and braces: clear anything a hard-killed run may have left behind.
+    teardown
+}
+
+case "${1:-}" in
+    start) cmd_start ;;
+    run)   cmd_run ;;
+    abort) cmd_abort ;;
+    *) echo "usage: recovery-update {start|run|abort}" >&2; exit 2 ;;
+esac

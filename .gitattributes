@@ -1,0 +1,17 @@
+# These run on Linux (Raspberry Pi) — never let Windows checkouts introduce
+# CRLF, which would break shebangs and here-docs on the target.
+*.sh            text eol=lf
+helpers/*       text eol=lf
+lib/*           text eol=lf
+tftp/*          text eol=lf
+sudoers.d/*     text eol=lf
+systemd/*       text eol=lf
+dnsmasq.d/*     text eol=lf
+etc/*           text eol=lf
+*.py            text eol=lf
+*.yml           text eol=lf
+*.conf          text eol=lf
+VERSION         text eol=lf
+install.sh      text eol=lf
+update.sh       text eol=lf
+uninstall.sh    text eol=lf

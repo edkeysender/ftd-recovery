@@ -3,3 +3,4 @@ ftd ALL=(root) NOPASSWD: /usr/sbin/arp-scan
 ftd ALL=(root) NOPASSWD: /usr/local/bin/recovery-remount
 ftd ALL=(root) NOPASSWD: /usr/local/bin/recovery-change-storage
 ftd ALL=(root) NOPASSWD: /usr/sbin/smartctl
+ftd ALL=(root) NOPASSWD: /usr/local/bin/recovery-update
