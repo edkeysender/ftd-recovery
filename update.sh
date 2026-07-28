@@ -60,7 +60,7 @@ echo
 log "checking system packages"
 export DEBIAN_FRONTEND=noninteractive
 missing=()
-for pkg in smartmontools git strongswan xl2tpd ppp; do
+for pkg in smartmontools git strongswan strongswan-swanctl xl2tpd ppp; do
     dpkg -s "$pkg" &>/dev/null || missing+=("$pkg")
 done
 if [[ ${#missing[@]} -gt 0 ]]; then
@@ -71,7 +71,7 @@ if [[ ${#missing[@]} -gt 0 ]]; then
         # up on demand instead. Only touched when freshly installed, so a
         # VPN-carried update can never stop its own tunnel.
         case " ${missing[*]} " in
-            *" strongswan "*|*" xl2tpd "*)
+            *" strongswan "*|*" strongswan-swanctl "*|*" xl2tpd "*)
                 systemctl disable --now xl2tpd strongswan-starter 2>/dev/null || true ;;
         esac
     else
@@ -79,6 +79,41 @@ if [[ ${#missing[@]} -gt 0 ]]; then
     fi
 else
     ok "packages up to date"
+fi
+
+# ── Step 1a: VPN daemon (strongSwan 6) ───────────────────────────────────────
+# strongSwan 6 removed the legacy `ipsec`/starter interface; the VPN helper
+# drives charon-systemd over vici with swanctl. Retire the conflicting legacy
+# starter, mask the unusable swanctl unit some builds ship in a 'bad' state,
+# and smoke-test that charon is actually reachable — so a device never looks
+# "updated" while silently unable to bring up the field VPN.
+if command -v swanctl &>/dev/null; then
+    log "verifying VPN stack (strongSwan 6)"
+    systemctl disable --now strongswan-starter.service 2>/dev/null || true
+    systemctl mask strongswan-swanctl.service 2>/dev/null || true
+    vpn_ok=0
+    if systemctl is-active --quiet strongswan.service || systemctl is-active --quiet ipsec.service; then
+        # Daemon already up (e.g. this very update is running over the VPN) —
+        # don't disturb it, just probe.
+        swanctl --stats &>/dev/null && vpn_ok=1
+    else
+        for svc in strongswan.service ipsec.service; do
+            systemctl cat "$svc" &>/dev/null || continue
+            systemctl start "$svc" 2>/dev/null || true
+            swanctl --stats &>/dev/null && vpn_ok=1
+            systemctl stop "$svc" 2>/dev/null || true
+            break
+        done
+    fi
+    if [[ $vpn_ok -eq 1 ]]; then
+        ok "VPN stack functional (charon reachable via swanctl)"
+    else
+        warn "VPN stack NOT functional — field (off-network) updates will fail."
+        warn "  debug: sudo systemctl start strongswan.service && sudo swanctl --stats"
+    fi
+else
+    warn "swanctl not installed — field (off-network) updates will not work."
+    warn "  install in-network: sudo apt-get install -y strongswan strongswan-swanctl xl2tpd ppp"
 fi
 
 # ── Step 2: lib files ────────────────────────────────────────────────────────

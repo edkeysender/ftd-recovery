@@ -30,10 +30,11 @@ GITLAB_IP=""
 # Seconds to wait for the PPP link to come up.
 VPN_TIMEOUT=90
 
-# IKE/ESP proposal lists (strongswan syntax) — override only if the gateway
-# rejects the defaults.
-#VPN_IKE="aes256-sha2_256-modp2048,aes256-sha1-modp2048,aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024"
-#VPN_ESP="aes256-sha2_256,aes256-sha1,aes128-sha1,3des-sha1"
+# IKE/ESP proposal lists (strongSwan 6 swanctl syntax) — override only if the
+# gateway rejects the defaults. 'default' appends strongSwan's built-ins for
+# compatibility. Crypto is provided by the openssl plugin.
+#VPN_IKE="aes256-sha256-modp2048,aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024,default"
+#VPN_ESP="aes256-sha256,aes256-sha1,aes128-sha1,3des-sha1,default"
 
 # ── Repository access (optional) ─────────────────────────────────────────────
 # Read-only GitLab deploy token (project Settings → Repository → Deploy

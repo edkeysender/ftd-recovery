@@ -78,14 +78,17 @@ export DEBIAN_FRONTEND=noninteractive
     parted e2fsprogs \
     curl wget ca-certificates \
     isc-dhcp-common smartmontools \
-    git strongswan xl2tpd ppp \
+    git strongswan strongswan-swanctl xl2tpd ppp \
     >/dev/null ) &
 _spin $!
 wait $!
 # tftpd-hpa is installed for the tftp-hpa user/group; we still let dnsmasq serve TFTP.
 systemctl disable --now tftpd-hpa 2>/dev/null || true
-# VPN daemons are brought up on demand by recovery-update, not at boot.
+# strongSwan 6 uses charon-systemd + swanctl; retire the legacy starter and
+# mask the unusable swanctl unit. VPN daemons come up on demand via
+# recovery-update, not at boot.
 systemctl disable --now xl2tpd strongswan-starter 2>/dev/null || true
+systemctl mask strongswan-swanctl.service 2>/dev/null || true
 ok "system packages installed"
 
 # ── Step 2: network detection ───────────────────────────────────────────────

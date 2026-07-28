@@ -3,11 +3,11 @@
 #
 # Pulls the configured ref from the internal GitLab and runs update.sh from
 # it. Devices inside the company network reach GitLab directly; devices in
-# the field connect through an on-demand L2TP/IPsec tunnel (strongswan +
-# xl2tpd, preshared key from update.conf). The operator's VPN username and
-# password arrive on stdin, live only in RAM (/dev/shm) while the link
-# authenticates, and the tunnel is torn down as soon as the update ends —
-# success, failure, or abort.
+# the field connect through an on-demand L2TP/IPsec tunnel (strongSwan 6
+# via swanctl + xl2tpd, preshared key from update.conf). The operator's VPN
+# username and password arrive on stdin, live only in RAM (/dev/shm) while
+# the link authenticates, and the tunnel is torn down as soon as the update
+# ends — success, failure, or abort.
 #
 # Split tunnel: pppd is run without 'defaultroute' or 'usepeerdns', and the
 # only route added is a /32 to GitLab — the Pi keeps serving PXE/NFS/DHCP on
@@ -37,6 +37,14 @@ HOSTS_MARK="# ftd-recovery-update"
 L2TP_CONN="ftd-update"
 L2TP_CONTROL="/var/run/xl2tpd/l2tp-control"
 
+# strongSwan 6 tooling (full paths — systemd-run's PATH is minimal). The
+# legacy `ipsec`/starter interface was removed in strongSwan 6; we drive the
+# charon-systemd daemon over vici with swanctl.
+SWANCTL="/usr/sbin/swanctl"
+XL2TPD="/usr/sbin/xl2tpd"
+PPPD="/usr/sbin/pppd"
+SWAN_CONF="/etc/swanctl/conf.d/ftd-update.conf"
+
 # Defaults — override in $CONF.
 GITLAB_URL="http://gitlab.ftdinternal.aero/ftd-supp/ftd_recovery"
 GITLAB_HOST=""
@@ -44,8 +52,11 @@ GITLAB_IP=""
 VPN_GATEWAY=""
 VPN_PSK=""
 VPN_TIMEOUT=90
-VPN_IKE="aes256-sha2_256-modp2048,aes256-sha1-modp2048,aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024"
-VPN_ESP="aes256-sha2_256,aes256-sha1,aes128-sha1,3des-sha1"
+# swanctl proposal syntax (NOT ipsec.conf). Crypto is provided by the
+# openssl plugin. 'default' appends strongSwan's built-in proposals for
+# maximum gateway compatibility.
+VPN_IKE="aes256-sha256-modp2048,aes256-sha1-modp1024,aes128-sha1-modp1024,3des-sha1-modp1024,default"
+VPN_ESP="aes256-sha256,aes256-sha1,aes128-sha1,3des-sha1,default"
 REPO_REF="main"
 GITLAB_TOKEN_USER=""
 GITLAB_TOKEN=""
@@ -55,6 +66,9 @@ GITLAB_TOKEN=""
 [[ -n "$GITLAB_HOST" ]] || GITLAB_HOST=$(sed -E 's|^[a-z]+://([^/:]+).*|\1|' <<<"$GITLAB_URL")
 
 [[ $EUID -eq 0 ]] || { echo "recovery-update: must run as root" >&2; exit 1; }
+
+IPSEC_SVC=""   # charon-systemd service, resolved at connect time
+PPP_IF=""
 
 logu() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >> "$LOG"; }
 
@@ -66,7 +80,7 @@ set_status() {
     mv "$STATUS.tmp" "$STATUS"
 }
 
-fail() {  # fail <step> <message-for-status> [extra log lines already written]
+fail() {  # fail <step> <message-for-status>
     local step=$1 msg=$2
     logu "ERROR: $msg"
     set_status failed "$step" "$msg"
@@ -79,26 +93,44 @@ gitlab_reachable() {
     curl -sS -m 8 -o /dev/null "$GITLAB_URL" 2>/dev/null
 }
 
+# Resolve the charon-systemd service name (strongSwan 6 ships it as
+# strongswan.service, aliased to ipsec.service on some builds).
+resolve_ipsec_svc() {
+    local svc
+    for svc in strongswan.service ipsec.service; do
+        systemctl cat "$svc" >/dev/null 2>&1 && { IPSEC_SVC=$svc; return 0; }
+    done
+    return 1
+}
+
 vpn_diag() {  # append recent VPN daemon logs to the update log
-    journalctl -n 20 --no-pager -t pppd -t xl2tpd -t charon >> "$LOG" 2>/dev/null || true
+    journalctl -n 25 --no-pager -u "${IPSEC_SVC:-strongswan}" -t xl2tpd -t pppd \
+        >> "$LOG" 2>/dev/null || true
+    "$SWANCTL" --list-sas >> "$LOG" 2>/dev/null || true
 }
 
 WORK=""
-PPP_IF=""
 teardown_done=0
 teardown() {
     [[ $teardown_done -eq 1 ]] && return 0
     teardown_done=1
     rm -f "$CREDS" "$PPP_OPTS"
+    # L2TP session down
     if [[ -e "$L2TP_CONTROL" ]]; then
-        logu "disconnecting VPN"
+        logu "disconnecting L2TP"
         echo "d $L2TP_CONN" > "$L2TP_CONTROL" 2>/dev/null || true
         sleep 1
     fi
     systemctl stop xl2tpd 2>/dev/null || true
-    ipsec down "$L2TP_CONN" 2>/dev/null || true
-    systemctl stop strongswan-starter 2>/dev/null \
-        || systemctl stop strongswan 2>/dev/null || true
+    # IPsec down + remove our connection/secret, then stop the daemon we started
+    if [[ -x "$SWANCTL" ]]; then
+        "$SWANCTL" --terminate --ike "$L2TP_CONN" 2>/dev/null || true
+    fi
+    if [[ -f "$SWAN_CONF" ]]; then
+        rm -f "$SWAN_CONF"
+        [[ -x "$SWANCTL" ]] && "$SWANCTL" --load-all >/dev/null 2>&1 || true
+    fi
+    [[ -n "$IPSEC_SVC" ]] && systemctl stop "$IPSEC_SVC" 2>/dev/null || true
     [[ -n "$GITLAB_IP" ]] && ip route del "$GITLAB_IP/32" 2>/dev/null || true
     sed -i "\|${HOSTS_MARK}\$|d" /etc/hosts 2>/dev/null || true
     [[ -n "$WORK" ]] && rm -rf "$WORK"
@@ -107,11 +139,10 @@ teardown() {
 
 vpn_connect() {
     set_status running vpn "connecting VPN (L2TP/IPsec)"
-    local bin
-    for bin in ipsec xl2tpd pppd; do
-        command -v "$bin" >/dev/null 2>&1 \
-            || fail vpn "$bin is not installed — run update.sh once with internet access"
-    done
+    [[ -x "$SWANCTL" ]] || fail vpn "swanctl not installed — run update.sh in-network first"
+    [[ -x "$XL2TPD" ]]  || fail vpn "xl2tpd not installed — run update.sh in-network first"
+    [[ -x "$PPPD" ]]    || fail vpn "pppd not installed — run update.sh in-network first"
+    resolve_ipsec_svc   || fail vpn "no charon-systemd service (strongswan.service/ipsec.service) found"
     [[ -n "$VPN_GATEWAY" ]] || fail vpn "VPN_GATEWAY not set in $CONF"
     [[ -n "$VPN_PSK" ]]     || fail vpn "VPN_PSK not set in $CONF"
     [[ -n "$GITLAB_IP" ]]   || fail vpn "GITLAB_IP not set in $CONF — required to route GitLab through the tunnel"
@@ -122,31 +153,67 @@ vpn_connect() {
     vpn_pass=$(sed -n 2p "$CREDS")
     [[ -n "$vpn_user" && -n "$vpn_pass" ]] || fail vpn "VPN credentials required"
 
-    # IPsec transport to the gateway (IKEv1 + PSK, the L2TP/IPsec standard).
-    cat > /etc/ipsec.conf <<EOF
-# Written by recovery-update — regenerated on every update run.
-config setup
+    # The legacy starter, if present, holds the same UDP ports — retire it.
+    systemctl stop strongswan-starter.service 2>/dev/null || true
 
-conn $L2TP_CONN
-    auto=add
-    keyexchange=ikev1
-    authby=secret
-    type=transport
-    left=%defaultroute
-    leftprotoport=17/1701
-    right=$VPN_GATEWAY
-    rightprotoport=17/1701
-    ike=$VPN_IKE!
-    esp=$VPN_ESP!
-EOF
-    ( umask 077; cat > /etc/ipsec.secrets <<EOF
+    # swanctl connection: IKEv1 + PSK, transport mode, L2TP (UDP/1701)
+    # traffic selectors. The connection block is heredoc-expanded, but the
+    # IPsec PSK is emitted via printf so a literal '$' in the key can't be
+    # shell-expanded. The PSK here is VPN_PSK (the site key) — the operator's
+    # username/password are L2TP/PPP creds and go into the ppp options file.
+    mkdir -p /etc/swanctl/conf.d
+    ( umask 077
+      { cat <<EOF
 # Written by recovery-update — regenerated on every update run.
-%any %any : PSK "$VPN_PSK"
+connections {
+   $L2TP_CONN {
+      version = 1
+      local_addrs = %any
+      remote_addrs = $VPN_GATEWAY
+      proposals = $VPN_IKE
+      rekey_time = 0
+      local  { auth = psk }
+      remote { auth = psk }
+      children {
+         $L2TP_CONN {
+            mode = transport
+            local_ts  = dynamic[udp/l2tp]
+            remote_ts = dynamic[udp/l2tp]
+            esp_proposals = $VPN_ESP
+            start_action = none
+            dpd_action = clear
+         }
+      }
+   }
+}
 EOF
+        printf 'secrets {\n   ike-%s {\n      secret = "%s"\n   }\n}\n' \
+            "$L2TP_CONN" "$VPN_PSK"
+      } > "$SWAN_CONF"
     )
 
-    # L2TP over the IPsec transport; ppp options live in RAM only because
-    # they carry the operator's credentials.
+    local before_ppp
+    before_ppp=$(ls /sys/class/net 2>/dev/null | grep '^ppp' | sort | tr '\n' ' ' || true)
+
+    logu "starting charon ($IPSEC_SVC)"
+    systemctl start "$IPSEC_SVC" || fail vpn "could not start $IPSEC_SVC"
+    local waited=0
+    until "$SWANCTL" --stats >/dev/null 2>&1; do
+        sleep 1; waited=$((waited + 1))
+        (( waited >= 15 )) && fail vpn "charon/vici did not come up"
+    done
+
+    logu "loading swanctl config"
+    "$SWANCTL" --load-all >>"$LOG" 2>&1 || { vpn_diag; fail vpn "swanctl --load-all failed"; }
+
+    logu "initiating IPsec to $VPN_GATEWAY"
+    if ! "$SWANCTL" --initiate --child "$L2TP_CONN" >>"$LOG" 2>&1; then
+        vpn_diag
+        fail vpn "IPsec negotiation with $VPN_GATEWAY failed — check VPN_GATEWAY/VPN_PSK/proposals"
+    fi
+
+    # L2TP over the IPsec transport. PPP options carry the operator creds, so
+    # they live in RAM only.
     cat > /etc/xl2tpd/xl2tpd.conf <<EOF
 ; Written by recovery-update — regenerated on every update run.
 [global]
@@ -175,23 +242,6 @@ EOF
     )
     rm -f "$CREDS"
 
-    local before_ppp
-    before_ppp=$(ls /sys/class/net 2>/dev/null | grep '^ppp' | sort | tr '\n' ' ')
-
-    logu "starting IPsec to $VPN_GATEWAY"
-    systemctl restart strongswan-starter 2>/dev/null \
-        || systemctl restart strongswan 2>/dev/null \
-        || fail vpn "could not start strongswan"
-    local waited=0
-    until ipsec status >/dev/null 2>&1; do
-        sleep 1; waited=$((waited + 1))
-        (( waited >= 15 )) && fail vpn "IPsec daemon did not come up"
-    done
-    if ! ipsec up "$L2TP_CONN" >> "$LOG" 2>&1; then
-        vpn_diag
-        fail vpn "IPsec negotiation with $VPN_GATEWAY failed — check VPN_GATEWAY/VPN_PSK"
-    fi
-
     logu "starting L2TP session"
     systemctl restart xl2tpd 2>/dev/null || fail vpn "could not start xl2tpd"
     waited=0
@@ -201,7 +251,6 @@ EOF
     done
     echo "c $L2TP_CONN" > "$L2TP_CONTROL"
 
-    # Wait for the ppp interface to come up with an address.
     logu "waiting for PPP link (timeout ${VPN_TIMEOUT}s)"
     waited=0
     PPP_IF=""
@@ -336,6 +385,7 @@ cmd_abort() {
         echo "no update running"
     fi
     # Belt and braces: clear anything a hard-killed run may have left behind.
+    resolve_ipsec_svc || true
     teardown
 }
 
