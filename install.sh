@@ -118,11 +118,11 @@ SUBNET_CIDR="${SUBNET_CIDR:-$DETECTED_CIDR}"
 if [[ -n "$SERVER_IP" && -n "$SUBNET_CIDR" ]]; then
     echo "${DIM}Detected:  server-ip=${SERVER_IP}  subnet=${SUBNET_CIDR}${RESET}"
     if ! confirm "Use detected network config?" "y"; then
-        SERVER_IP=$(ask "This Pi's static IP on $INTERFACE (clients fetch boot files from here)" "$SERVER_IP")
+        SERVER_IP=$(ask "This Pi's current IP on $INTERFACE" "$SERVER_IP")
         SUBNET_CIDR=$(ask "Subnet CIDR served by proxy-DHCP" "$SUBNET_CIDR")
     fi
 else
-    SERVER_IP=$(ask "This Pi's static IP on $INTERFACE (clients fetch boot files from here)" "$SERVER_IP")
+    SERVER_IP=$(ask "This Pi's current IP on $INTERFACE" "$SERVER_IP")
     SUBNET_CIDR=$(ask "Subnet CIDR served by proxy-DHCP" "$SUBNET_CIDR")
 fi
 
@@ -175,8 +175,8 @@ ok "app installed"
 log "laying down TFTP tree under /srv/tftp"
 mkdir -p /srv/tftp/debian-installer/amd64/grub /srv/tftp/clonezilla
 
-render "$SCRIPT_DIR/tftp/ocs-backup.sh"  /srv/tftp/ocs-backup.sh  0755 "SERVER_IP=$SERVER_IP"
-render "$SCRIPT_DIR/tftp/ocs-restore.sh" /srv/tftp/ocs-restore.sh 0755 "SERVER_IP=$SERVER_IP"
+install -m 0755 "$SCRIPT_DIR/tftp/ocs-backup.sh"  /srv/tftp/ocs-backup.sh
+install -m 0755 "$SCRIPT_DIR/tftp/ocs-restore.sh" /srv/tftp/ocs-restore.sh
 install -m 0644 "$SCRIPT_DIR/tftp/debian-installer/amd64/grub/grub.cfg" \
                 /srv/tftp/debian-installer/amd64/grub/grub.cfg
 
@@ -224,7 +224,7 @@ log "installing helper scripts and sudoers fragments"
 mkdir -p /usr/local/lib/ftd-recovery
 install -m 0644 "$SCRIPT_DIR/lib/common.sh"       /usr/local/lib/ftd-recovery/common.sh
 install -m 0644 "$SCRIPT_DIR/lib/disc-mapping.sh" /usr/local/lib/ftd-recovery/disc-mapping.sh
-render "$SCRIPT_DIR/helpers/recovery-grubcfg" /usr/local/bin/recovery-grubcfg 0755 "SERVER_IP=$SERVER_IP"
+install -m 0755 "$SCRIPT_DIR/helpers/recovery-grubcfg" /usr/local/bin/recovery-grubcfg
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-allowlist"     /usr/local/bin/recovery-allowlist
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-rmimage"       /usr/local/bin/recovery-rmimage
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-remount"       /usr/local/bin/recovery-remount
@@ -276,7 +276,7 @@ ok "NFS export active"
 log "installing systemd units"
 render "$SCRIPT_DIR/systemd/recovery-interface.service" /etc/systemd/system/recovery-interface.service 0644 \
     "INSTALL_PREFIX=$INSTALL_PREFIX" "SERVICE_USER=$SERVICE_USER" \
-    "INTERFACE=$INTERFACE" "SERVER_IP=$SERVER_IP"
+    "INTERFACE=$INTERFACE"
 render "$SCRIPT_DIR/systemd/recovery-dhcp-sniffer.service" /etc/systemd/system/recovery-dhcp-sniffer.service 0644 \
     "INSTALL_PREFIX=$INSTALL_PREFIX" "INTERFACE=$INTERFACE"
 install -m 0644 "$SCRIPT_DIR/systemd/clonezilla-http.service" /etc/systemd/system/clonezilla-http.service
@@ -307,7 +307,10 @@ else
     IP_NOTE="To set a static IP, configure ${BOLD}$INTERFACE${RESET} in your network manager or /etc/network/interfaces and reboot."
 fi
 
-echo "${YELLOW}Note:${RESET} the IP address above must not change after installation."
+echo "${YELLOW}Note:${RESET} services detect the Pi's current IP at runtime, so a DHCP lease"
+echo "change won't break anything — but the browser URL above moves with it."
+echo "A static IP (or DHCP reservation) keeps the URL stable. The ${BOLD}subnet${RESET} must"
+echo "not change: the NFS export and proxy-DHCP range are bound to it."
 echo "$IP_NOTE"
 echo
 echo "${DIM}Troubleshooting:"

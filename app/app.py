@@ -1493,6 +1493,39 @@ async def api_scan():
     if state is not None:
         save_state(state)
 
+    # IP moves: a known NIC re-appearing at a new address (e.g. a machine
+    # that got a DHCP lease first and was later moved to a fixed IP). Follow
+    # the MAC — otherwise the entry keeps its stale IP forever and the device
+    # can never be re-added, because known MACs are filtered out of
+    # `discovered` below.
+    moved: list[dict] = []
+    found_set = set(found)
+    entry_by_mac: dict[str, dict] = {}
+    for h in hosts:
+        m = h.get("mac")
+        if not m:
+            continue
+        try:
+            entry_by_mac.setdefault(normalize_mac(m), h)
+        except ValueError:
+            continue
+    for ip, mac in found:
+        if ip in skip_ips:
+            continue
+        h = entry_by_mac.get(mac)
+        if not h or h["host"] == ip:
+            continue
+        # Ambiguous cases stay untouched: the old address still answers for
+        # this MAC, or the new address belongs to another entry (dedup below
+        # sorts those out).
+        if (h["host"], mac) in found_set or ip in by_ip:
+            continue
+        moved.append({"mac": mac, "name": h.get("name"),
+                      "old_host": h["host"], "new_host": ip})
+        known_ips.discard(h["host"])
+        known_ips.add(ip)
+        h["host"] = ip
+
     # Build {mac: name} from WSD by matching current arp-scan IPs.
     wsd_by_mac: dict[str, str] = {}
     if wsd_names:
@@ -1569,10 +1602,10 @@ async def api_scan():
     if drop_ids:
         hosts = [h for h in hosts if id(h) not in drop_ids]
 
-    if renamed or replaced or removed:
+    if renamed or replaced or removed or moved:
         save_hosts(hosts)
     return {"ok": True, "added": added, "renamed": renamed,
-            "replaced": replaced, "removed": removed,
+            "replaced": replaced, "removed": removed, "moved": moved,
             "discovered": discovered, "scanned": len(found)}
 
 
@@ -2198,7 +2231,7 @@ async function openAddDevicesPicker(btn) {
     const rank = c => c === 'pc' ? 0 : (c === 'unknown' ? 1 : 2);
     const ipKey = ip => ip.split('.').map(n => String(n).padStart(3, '0')).join('.');
     discovered.sort((a, b) => rank(a.category) - rank(b.category) || ipKey(a.host).localeCompare(ipKey(b.host)));
-    warnings = { replaced: d.replaced || [], removed: d.removed || [] };
+    warnings = { replaced: d.replaced || [], removed: d.removed || [], moved: d.moved || [] };
   } catch (e) {
     list.innerHTML = `<li class="muted">Scan failed: ${escapeHtml(e.message)}</li>`;
     sub.textContent = '';
@@ -2260,10 +2293,17 @@ async function openAddDevicesPicker(btn) {
   }
   // Surface MAC-change / dedup warnings even if no devices were discovered.
   const warn = document.getElementById('warnBanner');
-  if (warnings && (warnings.replaced.length || warnings.removed.length)) {
+  if (warnings && (warnings.replaced.length || warnings.removed.length || warnings.moved.length)) {
     warn.className = 'banner warn';
     const parts = [];
+    if (warnings.moved.length) {
+      parts.push('<strong>IP address changed — entries updated to follow the device:</strong>');
+      parts.push(warnings.moved.map(r =>
+        `&nbsp;&nbsp;"${escapeHtml(r.name || r.mac)}": ${escapeHtml(r.old_host)} → ${escapeHtml(r.new_host)}`
+      ).join('<br>'));
+    }
     if (warnings.replaced.length) {
+      if (parts.length) parts.push('<br>');
       parts.push('<strong>⚠ MAC address changed at these IPs — hardware was swapped:</strong>');
       parts.push(warnings.replaced.map(r =>
         `&nbsp;&nbsp;${escapeHtml(r.host)}: ${escapeHtml(r.old_mac)} → ${escapeHtml(r.new_mac)} (was "${escapeHtml(r.old_name)}", now "${escapeHtml(r.new_name)}")`

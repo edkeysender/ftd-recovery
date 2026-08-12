@@ -1,7 +1,16 @@
 #!/bin/bash
 MAC=$(cat /sys/class/net/$(ip route show default | awk '/default/ {print $5}')/address | tr ':' '-')
 MAC_COLONS=$(echo "$MAC" | tr '-' ':')
-API="http://__SERVER_IP__:8088"
+
+# The recovery server's IP is never baked in — its DHCP lease can change.
+# The kernel cmdline this client booted with already carries it (fetch=…),
+# written by recovery-grubcfg at arm time; the NFS mount source is the backup.
+SRV=$(sed -nE 's|.*fetch=http://([^:/ ]+):.*|\1|p' /proc/cmdline)
+[ -z "$SRV" ] && SRV=$(findmnt -no SOURCE /home/partimag 2>/dev/null | cut -d: -f1)
+if [ -z "$SRV" ]; then
+    echo "WARNING: cannot determine recovery server IP (no fetch= on cmdline, no NFS mount)"
+fi
+API="http://${SRV}:8088"
 
 # Disarm immediately. A forced reboot mid-restore would otherwise PXE straight
 # back into restore. The end-of-script disarm below stays as a safety net.

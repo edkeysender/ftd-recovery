@@ -9,7 +9,9 @@ User=__SERVICE_USER__
 Group=__SERVICE_USER__
 Environment=RECOVERY_IFACE=__INTERFACE__
 WorkingDirectory=__INSTALL_PREFIX__
-ExecStart=__INSTALL_PREFIX__/venv/bin/uvicorn app:app --host __SERVER_IP__ --port 8088
+# Bind all interfaces: the Pi's address is DHCP-assigned and may change after
+# install; binding a fixed IP crash-loops the service when the lease drifts.
+ExecStart=__INSTALL_PREFIX__/venv/bin/uvicorn app:app --host 0.0.0.0 --port 8088
 Restart=on-failure
 RestartSec=3
 
