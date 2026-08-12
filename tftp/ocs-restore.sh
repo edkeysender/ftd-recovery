@@ -81,22 +81,43 @@ post_progress() {
         --data "$1" >/dev/null 2>&1 || true
 }
 
-# Shrink restore: ocs-sr compares *disk* sizes, not used data, so an image
-# taken from a bigger disk is refused outright on a smaller target. When that
-# is the case, skip the size check (-icds) and scale the partition table
-# proportionally (-k1); -r (already set) then grows/shrinks each filesystem
-# to its partition. This can still fail inside partclone if a source
-# partition holds more data than its scaled-down size — that needs the
-# source partition shrunk before backing up, or an equal-or-bigger disk.
+# Smaller-target handling. ocs-sr refuses any target smaller than the disk
+# the image came from, even when the partitions themselves fit. Keeping the
+# image's partition table unchanged and only skipping the whole-disk size
+# check (-icds) works whenever the highest-ending partition fits on the
+# target. Scaling partitions down instead (-k1) is a trap: partclone refuses
+# to restore a filesystem into a partition smaller than the filesystem,
+# regardless of how little data it holds. So when the layout does not fit,
+# stop before touching the disk and say what to do.
 EXTRA_OPTS=""
 PT_FILE=$(ls /home/partimag/${IMG}/*-pt.parted 2>/dev/null | head -1)
+SF_FILE=$(ls /home/partimag/${IMG}/*-pt.sf 2>/dev/null | head -1)
 SRC_SECTORS=$(sed -nE 's/^Disk [^:]+: ([0-9]+)s$/\1/p' "$PT_FILE" 2>/dev/null | head -1)
 TGT_SECTORS=$(cat /sys/block/$DISK/size 2>/dev/null)
 if [ -n "$SRC_SECTORS" ] && [ -n "$TGT_SECTORS" ] && [ "$TGT_SECTORS" -lt "$SRC_SECTORS" ]; then
-    echo "NOTE: target /dev/$DISK ($((TGT_SECTORS / 2097152)) GiB) is smaller than the"
-    echo "      disk this image was taken from ($((SRC_SECTORS / 2097152)) GiB)."
-    echo "      Enabling shrink restore: partitions are scaled proportionally."
-    EXTRA_OPTS="-icds -k1"
+    # Highest sector any partition ends at, from the image's sfdisk dump.
+    MAX_END=$(sed -nE 's/.*start= *([0-9]+), *size= *([0-9]+).*/\1 \2/p' "$SF_FILE" 2>/dev/null \
+        | awk '{e = $1 + $2; if (e > m) m = e} END {print m + 0}')
+    # Keep 33 sectors of headroom for the backup GPT header at the disk end.
+    if [ "${MAX_END:-0}" -gt 0 ] && [ "$TGT_SECTORS" -gt $((MAX_END + 33)) ]; then
+        echo "NOTE: target /dev/$DISK is smaller than the image's source disk,"
+        echo "      but the image's partitions fit — restoring layout unchanged."
+        EXTRA_OPTS="-icds"
+    else
+        echo "ERROR: this image cannot be restored to /dev/$DISK."
+        echo "  The image's partition layout ends at $(( ${MAX_END:-0} / 2097152 )) GiB,"
+        echo "  but the target disk is only $((TGT_SECTORS / 2097152)) GiB."
+        echo "  (Used data does not matter — partition SIZES must fit.)"
+        echo ""
+        echo "  Fix: on the source machine, shrink the big partition below the"
+        echo "  target size (Windows: Disk Management -> Shrink Volume), run a"
+        echo "  fresh BACKUP, then restore that image here. Or use a target"
+        echo "  disk at least as large as the original."
+        post_progress '{"phase":"failed","status":"failed","rc":97}'
+        curl -fsS -m 5 -X DELETE "${API}/api/arm/${MAC_COLONS}" >/dev/null 2>&1 || true
+        read -p "Press Enter to reboot..." _
+        reboot
+    fi
 fi
 
 post_progress '{"phase":"restore","percent":0,"status":"started"}'
