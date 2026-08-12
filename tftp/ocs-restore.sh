@@ -104,19 +104,28 @@ if [ -n "$SRC_SECTORS" ] && [ -n "$TGT_SECTORS" ] && [ "$TGT_SECTORS" -lt "$SRC_
         echo "      but the image's partitions fit — restoring layout unchanged."
         EXTRA_OPTS="-icds"
     else
-        echo "ERROR: this image cannot be restored to /dev/$DISK."
-        echo "  The image's partition layout ends at $(( ${MAX_END:-0} / 2097152 )) GiB,"
-        echo "  but the target disk is only $((TGT_SECTORS / 2097152)) GiB."
-        echo "  (Used data does not matter — partition SIZES must fit.)"
+        echo "WARNING: this image's partition layout does not fit /dev/$DISK."
+        echo "  The layout ends at $(( ${MAX_END:-0} / 2097152 )) GiB, but the target"
+        echo "  disk is only $((TGT_SECTORS / 2097152)) GiB. Used data does not matter —"
+        echo "  partition SIZES must fit."
         echo ""
-        echo "  Fix: on the source machine, shrink the big partition below the"
-        echo "  target size (Windows: Disk Management -> Shrink Volume), run a"
-        echo "  fresh BACKUP, then restore that image here. Or use a target"
-        echo "  disk at least as large as the original."
-        post_progress '{"phase":"failed","status":"failed","rc":97}'
-        curl -fsS -m 5 -X DELETE "${API}/api/arm/${MAC_COLONS}" >/dev/null 2>&1 || true
-        read -p "Press Enter to reboot..." _
-        reboot
+        echo "  Clean fix: shrink the big partition on the source machine"
+        echo "  (Windows: Disk Management -> Shrink Volume), take a fresh"
+        echo "  BACKUP, and restore that image instead."
+        echo ""
+        echo "  Forcing a proportional restore may still work: partitions whose"
+        echo "  filesystem cannot shrink will fail, and Clonezilla will ask"
+        echo "  whether to continue past each one. The result can be missing"
+        echo "  partitions (e.g. Windows recovery) or an unbootable system."
+        echo ""
+        read -p "  Type FORCE to try anyway, or press Enter to abort: " ans
+        if [ "$ans" = "FORCE" ]; then
+            EXTRA_OPTS="-icds -k1"
+        else
+            post_progress '{"phase":"failed","status":"failed","rc":97}'
+            curl -fsS -m 5 -X DELETE "${API}/api/arm/${MAC_COLONS}" >/dev/null 2>&1 || true
+            reboot
+        fi
     fi
 fi
 
