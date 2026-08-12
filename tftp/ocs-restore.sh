@@ -81,6 +81,24 @@ post_progress() {
         --data "$1" >/dev/null 2>&1 || true
 }
 
+# Shrink restore: ocs-sr compares *disk* sizes, not used data, so an image
+# taken from a bigger disk is refused outright on a smaller target. When that
+# is the case, skip the size check (-icds) and scale the partition table
+# proportionally (-k1); -r (already set) then grows/shrinks each filesystem
+# to its partition. This can still fail inside partclone if a source
+# partition holds more data than its scaled-down size — that needs the
+# source partition shrunk before backing up, or an equal-or-bigger disk.
+EXTRA_OPTS=""
+PT_FILE=$(ls /home/partimag/${IMG}/*-pt.parted 2>/dev/null | head -1)
+SRC_SECTORS=$(sed -nE 's/^Disk [^:]+: ([0-9]+)s$/\1/p' "$PT_FILE" 2>/dev/null | head -1)
+TGT_SECTORS=$(cat /sys/block/$DISK/size 2>/dev/null)
+if [ -n "$SRC_SECTORS" ] && [ -n "$TGT_SECTORS" ] && [ "$TGT_SECTORS" -lt "$SRC_SECTORS" ]; then
+    echo "NOTE: target /dev/$DISK ($((TGT_SECTORS / 2097152)) GiB) is smaller than the"
+    echo "      disk this image was taken from ($((SRC_SECTORS / 2097152)) GiB)."
+    echo "      Enabling shrink restore: partitions are scaled proportionally."
+    EXTRA_OPTS="-icds -k1"
+fi
+
 post_progress '{"phase":"restore","percent":0,"status":"started"}'
 
 (
@@ -102,7 +120,7 @@ post_progress '{"phase":"restore","percent":0,"status":"started"}'
 ) &
 REPORTER_PID=$!
 
-/usr/sbin/ocs-sr -g auto -e1 auto -e2 -r -j2 -scr restoredisk "$IMG" "$DISK" 2>&1 | tee "$PROGRESS_LOG"
+/usr/sbin/ocs-sr -g auto -e1 auto -e2 -r -j2 $EXTRA_OPTS -scr restoredisk "$IMG" "$DISK" 2>&1 | tee "$PROGRESS_LOG"
 RC=${PIPESTATUS[0]}
 
 kill "$REPORTER_PID" 2>/dev/null
