@@ -133,9 +133,15 @@ want to redeploy with a different storage choice.
 
 ## Network notes
 
-The installer does **not** configure a static IP. Either set a DHCP
-reservation for this Pi on your real DHCP server, or set a static IP via
-NetworkManager / `/etc/dhcpcd.conf` / `/etc/network/interfaces` before
-running the installer. Clients PXE-boot against the IP you give the
-installer — if that changes, you must re-run the installer (or re-render
-`/usr/local/bin/recovery-grubcfg` and the `ocs-*.sh` scripts by hand).
+The Pi's IP address is never baked into the installation. The web interface
+binds all interfaces (`0.0.0.0:8088`), per-MAC PXE boot configs embed the
+Pi's *current* address at the moment a job is armed (`recovery-grubcfg`
+detects it from the PXE interface), and the `ocs-*.sh` client scripts read
+the server address from their kernel cmdline at run time. A DHCP lease
+change therefore cannot break the service or strand clients — the only
+thing that moves is the browser URL. A static IP or DHCP reservation is
+still convenient for a stable URL, but no longer required.
+
+The **subnet** must stay the same after installation: the proxy-DHCP range
+(`/etc/dnsmasq.d/clonezilla-pxe.conf`) and the NFS export (`/etc/exports`)
+are bound to it. If the Pi moves to a different subnet, re-run the installer.

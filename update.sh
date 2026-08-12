@@ -131,6 +131,7 @@ install -m 0755 "$SCRIPT_DIR/helpers/recovery-remount"        /usr/local/bin/rec
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-change-storage" /usr/local/bin/recovery-change-storage
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-allowlist"      /usr/local/bin/recovery-allowlist
 install -m 0755 "$SCRIPT_DIR/helpers/recovery-update"         /usr/local/bin/recovery-update
+install -m 0755 "$SCRIPT_DIR/helpers/recovery-grubcfg"        /usr/local/bin/recovery-grubcfg
 ok "helpers updated"
 
 # ── Step 3b: self-update config ──────────────────────────────────────────────
@@ -183,16 +184,26 @@ install -m 0644 "$SCRIPT_DIR/VERSION"    "$INSTALL_PREFIX/VERSION"
 ok "app updated"
 
 # ── Step 6: OCS scripts (ocs-backup.sh / ocs-restore.sh) ────────────────────
+# The scripts derive the server IP from the client's kernel cmdline at run
+# time — nothing to render, and no stale install-time IP to carry forward.
 log "updating OCS scripts"
-SERVER_IP=$(sed -nE 's|.*API="http://([^:]+):.*|\1|p' /srv/tftp/ocs-backup.sh 2>/dev/null | head -1 || true)
-if [[ -n "$SERVER_IP" ]]; then
-    sed "s|__SERVER_IP__|$SERVER_IP|g" "$SCRIPT_DIR/tftp/ocs-backup.sh"  > /srv/tftp/ocs-backup.sh
-    sed "s|__SERVER_IP__|$SERVER_IP|g" "$SCRIPT_DIR/tftp/ocs-restore.sh" > /srv/tftp/ocs-restore.sh
-    chmod 0755 /srv/tftp/ocs-backup.sh /srv/tftp/ocs-restore.sh
-    ok "OCS scripts updated (server IP: $SERVER_IP)"
-else
-    warn "could not detect server IP from existing OCS scripts — skipping"
+install -m 0755 "$SCRIPT_DIR/tftp/ocs-backup.sh"  /srv/tftp/ocs-backup.sh
+install -m 0755 "$SCRIPT_DIR/tftp/ocs-restore.sh" /srv/tftp/ocs-restore.sh
+ok "OCS scripts updated"
+
+# ── Step 6a: recovery-interface unit ─────────────────────────────────────────
+# Re-render the unit: older installs baked the server IP into uvicorn --host,
+# which crash-loops the service if the Pi's DHCP lease ever changes.
+log "updating recovery-interface unit"
+UNIT_IFACE="${IFACE:-}"
+if [[ -z "$UNIT_IFACE" ]]; then
+    UNIT_IFACE=$(systemctl show recovery-interface --property=Environment --value 2>/dev/null \
+        | tr ' ' '\n' | sed -n 's/^RECOVERY_IFACE=//p' | head -1)
 fi
+[[ -z "$UNIT_IFACE" ]] && UNIT_IFACE=eth0
+render "$SCRIPT_DIR/systemd/recovery-interface.service" /etc/systemd/system/recovery-interface.service 0644 \
+    "INSTALL_PREFIX=$INSTALL_PREFIX" "SERVICE_USER=$SERVICE_USER" "INTERFACE=$UNIT_IFACE"
+ok "unit updated (iface: $UNIT_IFACE, binds 0.0.0.0)"
 
 # ── Step 7: Clonezilla payload ───────────────────────────────────────────────
 CLONEZILLA_VERSION="${CLONEZILLA_VERSION:-3.3.3-15}"

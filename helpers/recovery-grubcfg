@@ -6,6 +6,18 @@ set -euo pipefail
 
 DIR=/srv/tftp/debian-installer/amd64/grub
 
+# The server IP is detected when a job is armed, never baked in at install:
+# the Pi's DHCP lease can change and a stale address strands PXE clients.
+# Prefer the interface dnsmasq serves PXE on; fall back to the default route.
+server_ip() {
+  local iface addr
+  iface=$(sed -n 's/^interface=//p' /etc/dnsmasq.d/clonezilla-pxe.conf 2>/dev/null | head -1)
+  [[ -z "$iface" ]] && iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+  addr=$(ip -4 -o addr show dev "$iface" scope global 2>/dev/null \
+           | awk '{print $4}' | cut -d/ -f1 | head -1)
+  echo "$addr"
+}
+
 if [[ $# -lt 2 ]]; then
   echo "usage: $(basename "$0") {write <mac> <mode> [image]|remove <mac>}" >&2
   exit 2
@@ -40,6 +52,12 @@ case "$action" in
     image_arg=""
     [[ -n "$image" ]] && image_arg="ocs_image=${image} "
 
+    SERVER_IP=$(server_ip)
+    if [[ -z "$SERVER_IP" ]]; then
+      echo "cannot determine server IP (no address on PXE interface?)" >&2
+      exit 1
+    fi
+
     tmp=$(mktemp "${target}.XXXXXX")
     chmod 644 "$tmp"
     cat > "$tmp" <<EOF
@@ -47,7 +65,7 @@ set timeout=0
 set default=0
 
 menuentry "$label" {
-    linux (tftp)/clonezilla/vmlinuz boot=live locales=en_US.UTF-8 keyboard-layouts=us union=overlay username=user config components noswap edd=on enforcing=0 noeject vga=normal fetch=http://__SERVER_IP__:8080/clonezilla/filesystem.squashfs ${image_arg}ocs_prerun1="mount -t nfs __SERVER_IP__:/srv/clonezilla-images /home/partimag" ocs_prerun2="wget -q http://__SERVER_IP__:8080/${script} -O /tmp/r.sh" ocs_prerun3="chmod +x /tmp/r.sh" ocs_live_run="/tmp/r.sh" ocs_live_batch=no
+    linux (tftp)/clonezilla/vmlinuz boot=live locales=en_US.UTF-8 keyboard-layouts=us union=overlay username=user config components noswap edd=on enforcing=0 noeject vga=normal fetch=http://${SERVER_IP}:8080/clonezilla/filesystem.squashfs ${image_arg}ocs_prerun1="mount -t nfs ${SERVER_IP}:/srv/clonezilla-images /home/partimag" ocs_prerun2="wget -q http://${SERVER_IP}:8080/${script} -O /tmp/r.sh" ocs_prerun3="chmod +x /tmp/r.sh" ocs_live_run="/tmp/r.sh" ocs_live_batch=no
     initrd (tftp)/clonezilla/initrd.img
 }
 EOF
