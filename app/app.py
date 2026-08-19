@@ -2531,19 +2531,22 @@ function sizeCellHtml(img) {
 
 function machineCellHtml(g) {
   const name = g.machine_name || g.latest.name;
+  // Every button here is looked up by data-key in the delegated click handler,
+  // so all of them must carry it.
+  const key = escapeHtml(g.key);
   if (renamingMac === g.key) {
     return `
       <div class="rename-box">
         <input type="text" class="rename-input" value="${escapeHtml(name)}" maxlength="64">
-        <button data-action="rename-save">Save</button>
-        <button data-action="rename-cancel">Cancel</button>
+        <button data-action="rename-save" data-key="${key}">Save</button>
+        <button data-action="rename-cancel" data-key="${key}">Cancel</button>
       </div>`;
   }
   const sub = g.on_network
     ? `<div class="mach-sub">on the network · ${escapeHtml(g.host_ip || '')}</div>`
     : '<div class="mach-sub off">not on the network · name kept from backup</div>';
   const renameBtn = g.mac
-    ? '<button class="linkbtn" data-action="rename">rename</button>'
+    ? `<button class="linkbtn" data-action="rename" data-key="${key}">rename</button>`
     : '';
   return `
     <div class="mach-name"><span>${escapeHtml(name)}</span>${renameBtn}</div>
@@ -2637,6 +2640,8 @@ async function refreshBackups() {
     btn.addEventListener('click', () => {
       const a = btn.dataset.action;
       const g = groupByKey.get(btn.dataset.key);
+      // delete-image works off data-name alone; everything else needs its group.
+      if (!g && a !== 'delete-image') return;
       if (a === 'toggle') {
         if (openGroups.has(g.key)) openGroups.delete(g.key); else openGroups.add(g.key);
         refreshBackups();
