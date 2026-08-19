@@ -1888,7 +1888,8 @@ INDEX_HTML = """<!doctype html>
   .dev-name { display:flex; align-items:center; gap:7px; font-size:14px; }
   .dev-sub { font-family:var(--mono); font-size:11.5px; color:var(--fg-mute); margin-top:2px; }
   .name-edit { background:transparent; color:var(--fg); border:1px solid transparent; border-radius:4px;
-               padding:2px 5px; margin-left:-5px; font:inherit; width:14ch; min-width:14ch; max-width:26ch; }
+               padding:2px 5px; margin-left:-5px; font:inherit; flex-shrink:0;
+               width:104px; min-width:60px; max-width:340px; }
   .name-edit:hover { border-color:var(--line); }
   .name-edit:focus { outline:none; border-color:var(--blue); background:var(--panel-2); }
   .tag { font-family:var(--mono); font-size:9.5px; letter-spacing:0.1em; text-transform:uppercase;
@@ -2150,6 +2151,33 @@ function fmtDate(ts) {
 }
 
 function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
+
+// The device name doubles as its own editor, so the input has to be as wide as
+// the text it shows or the name reads truncated until you click into it. Sizing
+// by character count fails: `ch` is the width of "0", and machine names are full
+// of glyphs far wider than that (WS-26-006-CH, WWWW-MMMM-WWWW). Measure the real
+// rendered string instead, so it holds for any font the browser falls back to.
+const _textSizer = (() => {
+  try { return document.createElement('canvas').getContext('2d'); }
+  catch (e) { return null; }
+})();
+
+function fitNameInput(inp) {
+  const cs = getComputedStyle(inp);
+  let w;
+  if (_textSizer) {
+    _textSizer.font = `${cs.fontStyle} ${cs.fontWeight} ${cs.fontSize} ${cs.fontFamily}`;
+    w = _textSizer.measureText(inp.value || '').width;
+  } else {
+    w = (inp.value || '').length * parseFloat(cs.fontSize) * 0.68;   // rough fallback
+  }
+  // box-sizing is border-box, so the frame has to be paid for out of the width.
+  w += parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight)
+     + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth);
+  inp.style.width = Math.round(Math.min(320, Math.max(96, w + 6))) + 'px';
+  // Past the cap even a correctly-sized box clips, so keep the full name on hover.
+  inp.title = inp.value;
+}
 
 function escapeHtml(s) {
   if (s == null) return '';
@@ -2424,7 +2452,7 @@ async function refresh() {
                 <span class="dot" title="${h.online ? 'Online' : 'Offline'}"></span>
                 <div>
                   <div class="dev-name">
-                    <input class="name-edit" data-ip="${h.host}" data-original="${safeName}" value="${safeName}" size="1">${tag}
+                    <input class="name-edit" data-ip="${h.host}" data-original="${safeName}" value="${safeName}" title="${safeName}" size="1">${tag}
                   </div>
                   <div class="dev-sub">${escapeHtml(subBits.join(' · '))}</div>
                 </div>
@@ -2437,7 +2465,7 @@ async function refresh() {
       }).join('');
 
       rows.querySelectorAll('.name-edit').forEach(inp => {
-        const fit = () => { inp.style.width = Math.max(8, Math.min(26, inp.value.length + 1)) + 'ch'; };
+        const fit = () => fitNameInput(inp);
         fit();
         inp.addEventListener('input', fit);
         inp.addEventListener('blur', () => saveName(inp.dataset.ip, inp));
