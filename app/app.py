@@ -18,6 +18,7 @@ VERSION = (APP_DIR / "VERSION").read_text().strip() if (APP_DIR / "VERSION").exi
 HOSTS_FILE = APP_DIR / "hosts.yml"
 STATE_FILE = APP_DIR / "state.json"
 DHCP_NAMES_FILE = APP_DIR / "dhcp_names.json"
+MACHINE_NAMES_FILE = APP_DIR / "machine_names.json"
 IPXE_DIR = Path("/srv/tftp")
 ALLOWLIST_HELPER = "/usr/local/bin/recovery-allowlist"
 BACKUP_STORAGE = "/srv/clonezilla-images"
@@ -34,29 +35,44 @@ def _safe_name(candidate) -> str:
     return candidate if _SAFE_NAME_RE.match(candidate) else ""
 
 
+def backup_summary() -> dict[str, dict]:
+    """Scan the image store once: {mac: {"count": n, "latest": mtime}}.
+
+    /api/status needs both the image count and the newest timestamp for every
+    device on the page, so walk the directory once instead of per host.
+    """
+    base = Path(BACKUP_STORAGE)
+    out: dict[str, dict] = {}
+    if not base.is_dir():
+        return out
+    try:
+        entries = list(base.iterdir())
+    except OSError:
+        return out
+    for entry in entries:
+        if not entry.is_dir():
+            continue
+        m = _IMG_RE.match(entry.name)
+        if not m:
+            continue
+        mac = m.group(1).replace("-", ":")
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        rec = out.setdefault(mac, {"count": 0, "latest": 0.0})
+        rec["count"] += 1
+        if mtime > rec["latest"]:
+            rec["latest"] = mtime
+    return out
+
+
 def last_backup_at(mac: Optional[str]) -> Optional[float]:
     """Latest mtime across /srv/clonezilla-images/img-<MAC>{,-<timestamp>}/, or None."""
     if not mac:
         return None
-    base = Path(BACKUP_STORAGE)
-    if not base.is_dir():
-        return None
-    prefix = f"img-{mac.replace(':', '-')}"
-    latest = 0.0
-    try:
-        for entry in base.iterdir():
-            if not entry.is_dir():
-                continue
-            if entry.name == prefix or entry.name.startswith(f"{prefix}-"):
-                try:
-                    m = entry.stat().st_mtime
-                    if m > latest:
-                        latest = m
-                except OSError:
-                    continue
-    except OSError:
-        return None
-    return latest if latest > 0 else None
+    rec = backup_summary().get(mac)
+    return rec["latest"] if rec and rec["latest"] > 0 else None
 
 PING_TIMEOUT = 1
 HOSTNAME_TTL = 300
@@ -133,6 +149,82 @@ def load_dhcp_names() -> dict[str, str]:
 
 def is_auto_name(name: str) -> bool:
     return bool(_AUTO_NAME_RE.match(name or ""))
+
+
+# ---------- machine_names.json (backup group names, keyed by MAC) ----------
+#
+# A backup group is identified by its MAC, not by an entry in hosts.yml: images
+# outlive the device being on the network. We store the name the device had when
+# the backup was armed so the group stays labelled forever, and let the operator
+# rename it. A manual rename is never overwritten by a later capture or scan.
+
+def load_machine_names() -> dict[str, dict]:
+    """Return {normalized_mac: {"name": str, "source": "manual"|"auto"}}."""
+    if not MACHINE_NAMES_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(MACHINE_NAMES_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for mac, val in raw.items():
+        try:
+            mac_n = normalize_mac(mac)
+        except ValueError:
+            continue
+        if isinstance(val, str):  # tolerate a bare {mac: name} file
+            val = {"name": val, "source": "auto"}
+        if not isinstance(val, dict):
+            continue
+        name = _safe_name(val.get("name"))
+        if not name:
+            continue
+        out[mac_n] = {
+            "name": name,
+            "source": "manual" if val.get("source") == "manual" else "auto",
+        }
+    return out
+
+
+_names_write_failed = False
+
+
+def save_machine_names(names: dict[str, dict]) -> bool:
+    """Persist the name map. Never raises — a read-only rootfs must not break the
+    UI, and /api/images backfills on every poll, so only log the first failure."""
+    global _names_write_failed
+    try:
+        tmp = MACHINE_NAMES_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(names, indent=2, sort_keys=True))
+        tmp.replace(MACHINE_NAMES_FILE)
+        _names_write_failed = False
+        return True
+    except OSError as e:
+        if not _names_write_failed:
+            print(f"[machine-names] could not persist: {e}")
+            _names_write_failed = True
+        return False
+
+
+def remember_machine_name(mac: Optional[str], name: Optional[str],
+                          source: str = "auto") -> None:
+    """Record the device name for a MAC. 'auto' never overwrites a manual rename."""
+    if not mac:
+        return
+    clean = _safe_name(name)
+    if not clean:
+        return
+    names = load_machine_names()
+    existing = names.get(mac)
+    if existing:
+        if existing["source"] == "manual" and source != "manual":
+            return
+        if existing["name"] == clean and existing["source"] == source:
+            return
+    names[mac] = {"name": clean, "source": source}
+    save_machine_names(names)
 
 
 # ---------- state.json (armed MACs) ----------
@@ -774,6 +866,7 @@ async def api_status():
     state, expired = prune_expired(state)
     if expired:
         save_state_quiet(state, "status")
+    backups = backup_summary()
     out = []
     for h, p, hn, arp in zip(hosts, ping_r, hn_r, arp_r):
         online, latency = (False, None)
@@ -786,6 +879,7 @@ async def api_status():
         except ValueError:
             normalized = None
         armed = state["armed"].get(normalized) if normalized else None
+        b = backups.get(normalized) if normalized else None
         out.append({
             "name": h.get("name") or h["host"],
             "host": h["host"],
@@ -796,7 +890,8 @@ async def api_status():
             "latency_ms": latency,
             "armed": armed,
             "category": classify_mac(normalized),
-            "last_backup_at": last_backup_at(normalized),
+            "last_backup_at": (b["latest"] if b and b["latest"] > 0 else None),
+            "image_count": (b["count"] if b else 0),
             "progress": get_progress(normalized),
         })
     return {"checked_at": time.time(), "now": time.time(), "hosts": out,
@@ -942,6 +1037,8 @@ async def api_images():
     if not base.is_dir():
         return {"images": []}
     hosts_by_mac = {normalize_mac(h["mac"]): h for h in load_hosts() if h.get("mac")}
+    machine_names = load_machine_names()
+    backfilled = False
     now = time.time()
     images = []
     for entry in base.iterdir():
@@ -963,12 +1060,26 @@ async def api_images():
             mac = m.group(1).replace("-", ":") if m else None
             ts = m.group(2) if m else None
             host = hosts_by_mac.get(mac) if mac else None
+            stored = machine_names.get(mac) if mac else None
+            # Backfill: an image taken before names were persisted (or restored
+            # from an older install) adopts the name the device carries right
+            # now, so the group keeps a label once the device leaves the network.
+            if mac and not stored and host and _safe_name(host.get("name")):
+                stored = {"name": _safe_name(host.get("name")), "source": "auto"}
+                machine_names[mac] = stored
+                backfilled = True
+            machine_name = (stored or {}).get("name") or (host.get("name") if host else None)
             images.append({
                 "name": entry.name,
                 "size_bytes": size,
                 "mtime": latest_mtime,
                 "mac": mac,
                 "timestamp": ts,
+                "version": 1,
+                "version_count": 1,
+                "machine_name": machine_name,
+                "name_source": (stored or {}).get("source"),
+                "on_network": host is not None,
                 "host_name": host.get("name") if host else None,
                 "host_ip": host.get("host") if host else None,
                 "in_progress": (now - latest_mtime) < IN_PROGRESS_WINDOW,
@@ -978,12 +1089,22 @@ async def api_images():
         except OSError:
             continue
 
+    if backfilled:
+        save_machine_names(machine_names)
+
     # Assign reference sizes / percents to in-progress images using the most recent
     # completed (not in-progress) backup of the same MAC.
     by_mac = {}
     for img in images:
         if img["mac"]:
             by_mac.setdefault(img["mac"], []).append(img)
+
+    # Version numbers are derived, never stored: oldest image of a MAC is v1.
+    for group in by_mac.values():
+        for n, img in enumerate(sorted(group, key=lambda s: s["mtime"]), start=1):
+            img["version"] = n
+            img["version_count"] = len(group)
+
     for img in images:
         if not img["in_progress"] or not img["mac"]:
             continue
@@ -1017,6 +1138,39 @@ class NameUpdate(BaseModel):
     name: str = Field(min_length=1, max_length=64, pattern=_SAFE_NAME_PAT)
 
 
+@app.put("/api/machine/{mac}/name")
+async def update_machine_name(mac: str, payload: NameUpdate):
+    """Rename a backup group. The name is keyed by MAC, so it follows the
+    machine's images through IP changes and outlives it leaving the network."""
+    try:
+        mac_n = normalize_mac(mac)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    name = _safe_name(payload.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="invalid name")
+    names = load_machine_names()
+    names[mac_n] = {"name": name, "source": "manual"}
+    if not save_machine_names(names):
+        raise HTTPException(status_code=500, detail="could not persist the name")
+    # It is one machine with one name: if it is currently on the network, the
+    # device row must not keep showing the old label.
+    hosts = load_hosts()
+    changed = False
+    for h in hosts:
+        if not h.get("mac"):
+            continue
+        try:
+            if normalize_mac(h["mac"]) == mac_n and h.get("name") != name:
+                h["name"] = name
+                changed = True
+        except ValueError:
+            continue
+    if changed:
+        save_hosts(hosts)
+    return {"ok": True, "mac": mac_n, "name": name}
+
+
 @app.put("/api/host/{ip}/name")
 async def update_name(ip: str, payload: NameUpdate):
     hosts = load_hosts()
@@ -1024,6 +1178,12 @@ async def update_name(ip: str, payload: NameUpdate):
         if h.get("host") == ip:
             h["name"] = payload.name.strip() or h["host"]
             save_hosts(hosts)
+            # Renaming the device renames its backup group too — same machine.
+            if h.get("mac"):
+                try:
+                    remember_machine_name(normalize_mac(h["mac"]), h["name"], "manual")
+                except ValueError:
+                    pass
             return {"ok": True, "name": h["name"]}
     raise HTTPException(status_code=404, detail="host not found")
 
@@ -1197,6 +1357,11 @@ async def arm_host(ip: str, payload: ArmRequest):
             pass
         remove_grub_armed(mac)
         raise HTTPException(status_code=500, detail=f"state save failed: {e}")
+
+    # Capture the device's current name so the backup group stays labelled even
+    # after the machine leaves the network. A manual rename wins over this.
+    if payload.mode == "backup":
+        remember_machine_name(mac, target.get("name"), "auto")
 
     print(f"[arm] {ip} ({mac}) -> {payload.mode} (image={payload.image or 'own'}), expires {expires_at}")
     return {"ok": True, "mac": mac, "mode": payload.mode, "image": payload.image, "expires_at": expires_at}
@@ -1657,204 +1822,296 @@ INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Recovery Status</title>
 <style>
-  :root { color-scheme: dark; }
-  body { font-family: system-ui, sans-serif; background:#111; color:#ddd; margin:0; padding:24px; }
-  h1 { margin:0 0 4px; font-size:22px; }
-  .brand { color:#666; font-size:11px; text-transform:uppercase; letter-spacing:0.15em; margin-bottom:4px; }
-  .sub { color:#888; font-size:13px; margin-bottom:20px; }
-  table { border-collapse: collapse; width:100%; max-width:1200px; }
-  th, td { text-align:left; padding:10px 12px; border-bottom:1px solid #2a2a2a; vertical-align:middle; }
-  th { color:#888; font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:0.05em; }
-  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; vertical-align:middle; }
-  .online  .dot { background:#3fb950; box-shadow:0 0 6px #3fb950; }
-  .offline .dot { background:#f85149; }
-  .latency, .mac, .hostname { color:#bbb; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; font-size:13px; }
-  .muted { color:#666; }
-  .name-edit { background:transparent; color:#ddd; border:1px solid transparent; padding:4px 6px; border-radius:4px; font:inherit; width:100%; min-width:120px; }
-  .name-edit:hover { border-color:#333; }
-  .name-edit:focus { outline:none; border-color:#3b82f6; background:#1a1a1a; }
-  .actions { white-space:nowrap; display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
-  button { font:inherit; font-size:12px; padding:6px 10px; border-radius:5px; border:1px solid transparent; cursor:pointer; }
-  button:disabled { opacity:0.4; cursor:not-allowed; }
-  button.wol      { background:#1f6feb; color:#fff; }
-  button.wol:hover:not(:disabled){ background:#2f7fff; }
-  button.recovery { background:#1f6feb; color:#fff; }
-  button.recovery:hover:not(:disabled){ background:#2f7fff; }
-  button.backup   { background:#8a5a00; color:#fff; }
-  button.backup:hover:not(:disabled){ background:#a86d00; }
-  button.disarm   { background:#3a3a3a; color:#ddd; border-color:#555; }
-  button.disarm:hover:not(:disabled){ background:#4a4a4a; }
-  button.scan     { background:#2a2a2a; color:#ddd; border-color:#444; }
-  button.scan:hover:not(:disabled){ background:#3a3a3a; }
-  .header { display:flex; align-items:center; justify-content:space-between; max-width:1200px; margin-bottom:20px; gap:16px; }
-  .header h1 { margin:0 0 4px; }
-  .header .sub { margin:0; }
-  .armed { display:inline-flex; align-items:center; gap:8px; padding:4px 10px; border-radius:12px; font-size:12px; font-weight:500; }
-  .armed.recovery { background:rgba(31,111,235,0.15); color:#79b8ff; border:1px solid rgba(31,111,235,0.4); }
-  .armed.backup   { background:rgba(138,90,0,0.2);    color:#f0b85a; border:1px solid rgba(138,90,0,0.5); }
-  .armed .ttl { color:#aaa; font-variant-numeric: tabular-nums; }
-  .banner { max-width:1200px; padding:10px 14px; border-radius:6px; margin-bottom:16px; font-size:13px; display:none; }
-  .banner.err { display:block; background:rgba(248,81,73,0.12); border:1px solid #f85149; color:#ffb4af; }
-  .banner.warn { display:block; background:rgba(210,153,34,0.12); border:1px solid #d29922; color:#f0c674; line-height:1.6; }
-  .banner.warn .banner-dismiss { background:transparent; border:1px solid #d29922; color:#f0c674; margin-left:8px; padding:2px 8px; font-size:11px; }
-  .banner.warn .banner-dismiss:hover { background:rgba(210,153,34,0.2); }
-  .banner.ok-info { display:block; background:rgba(63,185,80,0.08); border:1px solid #2a2a2a; color:#9aa; font-size:12px; }
-  #toast { position:fixed; bottom:24px; right:24px; background:#1a1a1a; border:1px solid #333; padding:12px 16px; border-radius:6px; font-size:13px; opacity:0; transition:opacity .2s; max-width:400px; }
-  #toast.show { opacity:1; }
-  #toast.err { border-color:#f85149; }
-  #toast.ok  { border-color:#3fb950; }
-  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,0.6); display:none; align-items:center; justify-content:center; z-index:10; }
-  .modal-bg.show { display:flex; }
-  .modal { background:#161616; border:1px solid #333; border-radius:8px; padding:20px; min-width:480px; max-width:90vw; max-height:80vh; overflow:auto; }
-  .modal h2 { margin:0 0 4px; font-size:16px; }
-  .modal .sub { color:#888; font-size:12px; margin-bottom:14px; }
-  .modal ul.imgs { list-style:none; padding:0; margin:0 0 16px; max-height:50vh; overflow:auto; }
-  .modal ul.imgs li { padding:10px 12px; border:1px solid #2a2a2a; border-radius:5px; margin-bottom:6px; cursor:pointer; display:flex; justify-content:space-between; gap:12px; align-items:center; }
-  .modal ul.imgs li:hover { background:#1d1d1d; }
-  .modal ul.imgs li.selected { border-color:#1f6feb; background:rgba(31,111,235,0.08); }
-  .backups { margin-top:24px; }
-  .backups h2 { font-size:13px; color:#888; font-weight:500; text-transform:uppercase; letter-spacing:0.05em; margin:0 0 8px; }
-  .backups select.action { background:#222; color:#ddd; border:1px solid #333; border-radius:4px; padding:4px 8px; font-size:12px; cursor:pointer; }
-  .backups select.action:focus { outline:none; border-color:#1f6feb; }
-  .progress { display:flex; flex-direction:column; gap:3px; min-width:180px; }
-  .progress .bar { position:relative; height:12px; background:#222; border:1px solid #333; border-radius:3px; overflow:hidden; }
-  .progress .fill { height:100%; background:linear-gradient(90deg,#1f6feb,#3b82f6); transition:width 1s ease; }
-  .progress .label { font-size:11px; color:#aaa; font-variant-numeric: tabular-nums; }
-  .progress.indeterminate .fill { width:30% !important; animation: indet 1.4s ease-in-out infinite; }
+  :root {
+    color-scheme: dark;
+    --bg:#0c0c0e; --panel:#141417; --panel-2:#1a1a1e;
+    --line:#26262b; --line-soft:#1e1e22;
+    --fg:#e8e8ea; --fg-dim:#a0a0a8; --fg-mute:#6d6d76;
+    --green:#3fb950; --green-dim:rgba(63,185,80,0.12);
+    --amber:#d9a441; --amber-dim:rgba(217,164,65,0.12);
+    --red:#f85149;   --red-dim:rgba(248,81,73,0.12);
+    --blue:#4b8bf5;  --blue-dim:rgba(75,139,245,0.12);
+    --sans:'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --mono:'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  }
+  * { box-sizing:border-box; }
+  body { font-family:var(--sans); background:var(--bg); color:var(--fg); margin:0;
+         padding:28px 24px 64px; font-size:14px; line-height:1.45; }
+  .wrap { max-width:1180px; margin:0 auto; }
+  .mono { font-family:var(--mono); font-variant-numeric:tabular-nums; }
+  .muted { color:var(--fg-mute); }
+
+  /* ── header ───────────────────────────────────────────────── */
+  .topbar { display:flex; align-items:flex-start; justify-content:space-between; gap:24px; margin-bottom:22px; }
+  .eyebrow { font-family:var(--mono); font-size:10.5px; letter-spacing:0.18em; text-transform:uppercase;
+             color:var(--fg-mute); margin-bottom:6px; }
+  h1 { margin:0 0 6px; font-size:24px; font-weight:600; letter-spacing:-0.01em; }
+  .statusline { font-size:12px; color:var(--fg-dim); }
+  .topbar-actions { display:flex; gap:8px; flex-shrink:0; }
+
+  /* ── disk strip ───────────────────────────────────────────── */
+  .diskstrip { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+               font-family:var(--mono); font-size:12px; color:var(--fg-dim);
+               border:1px solid var(--line); border-radius:6px; padding:9px 13px; margin-bottom:18px; }
+  .diskstrip .free { color:var(--green); }
+  .diskstrip .sep { color:var(--line); }
+  .diskstrip.bad { border-color:var(--red); background:var(--red-dim); color:#ffb4af; }
+
+  .banner { border-radius:6px; margin-bottom:18px; font-size:13px; display:none; padding:11px 14px; }
+  .banner.warn { display:block; background:var(--amber-dim); border:1px solid rgba(217,164,65,0.45);
+                 color:#f0c674; line-height:1.6; }
+  .banner-dismiss { background:transparent; border:1px solid var(--amber); color:#f0c674;
+                    margin-left:8px; padding:2px 8px; font-size:11px; border-radius:4px; cursor:pointer; }
+  .banner-dismiss:hover { background:rgba(217,164,65,0.2); }
+
+  /* ── sections & tables ────────────────────────────────────── */
+  section { margin-bottom:34px; }
+  .sec-head { font-family:var(--mono); font-size:10.5px; letter-spacing:0.18em; text-transform:uppercase;
+              color:var(--fg-mute); margin:0 0 10px; font-weight:400; }
+  table { border-collapse:collapse; width:100%; }
+  thead th { font-family:var(--mono); font-size:10px; letter-spacing:0.14em; text-transform:uppercase;
+             color:var(--fg-mute); font-weight:400; text-align:left;
+             padding:0 14px 8px; border-bottom:1px solid var(--line); }
+  tbody td { padding:12px 14px; border-bottom:1px solid var(--line-soft); vertical-align:middle; }
+  tbody tr:hover > td { background:var(--panel); }
+  .ta-r { text-align:right; }
+  td.ta-r > * { justify-content:flex-end; }
+  .empty { color:var(--fg-mute); padding:18px 14px; }
+
+  /* ── device cell ──────────────────────────────────────────── */
+  .dev { display:flex; align-items:flex-start; gap:11px; }
+  .dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; margin-top:6px; background:var(--red); }
+  tr.online .dot { background:var(--green); box-shadow:0 0 7px rgba(63,185,80,0.7); }
+  .dev-name { display:flex; align-items:center; gap:7px; font-size:14px; }
+  .dev-sub { font-family:var(--mono); font-size:11.5px; color:var(--fg-mute); margin-top:2px; }
+  .name-edit { background:transparent; color:var(--fg); border:1px solid transparent; border-radius:4px;
+               padding:2px 5px; margin-left:-5px; font:inherit; width:14ch; min-width:14ch; max-width:26ch; }
+  .name-edit:hover { border-color:var(--line); }
+  .name-edit:focus { outline:none; border-color:var(--blue); background:var(--panel-2); }
+  .tag { font-family:var(--mono); font-size:9.5px; letter-spacing:0.1em; text-transform:uppercase;
+         padding:1px 5px; border-radius:3px; }
+  .tag.pc { background:var(--green-dim); color:var(--green); border:1px solid rgba(63,185,80,0.35); }
+  .tag.nonpc { background:var(--red-dim); color:#f0857c; border:1px solid rgba(248,81,73,0.35); }
+  .tag.unknown { background:var(--panel-2); color:var(--fg-mute); border:1px solid var(--line); }
+
+  /* ── buttons ──────────────────────────────────────────────── */
+  button { font:inherit; font-size:12px; padding:5px 11px; border-radius:5px;
+           border:1px solid var(--line); background:var(--panel-2); color:var(--fg-dim); cursor:pointer; }
+  button:hover:not(:disabled) { background:#232329; color:var(--fg); border-color:#33333a; }
+  button:disabled { opacity:0.35; cursor:not-allowed; }
+  button.primary { background:var(--blue); border-color:var(--blue); color:#fff; }
+  button.primary:hover:not(:disabled) { background:#5d99ff; border-color:#5d99ff; color:#fff; }
+  button.danger:hover:not(:disabled) { background:var(--red-dim); border-color:var(--red); color:#ff9c95; }
+  button.icon { padding:5px 8px; color:var(--fg-mute); line-height:1; }
+  .actions { display:flex; gap:6px; align-items:center; flex-wrap:wrap; }
+  .linkbtn { background:transparent; border:none; padding:0 2px; color:var(--fg-mute);
+             font-size:11px; text-decoration:underline; text-underline-offset:2px; }
+  .linkbtn:hover:not(:disabled) { background:transparent; color:var(--fg); border:none; }
+
+  /* ── armed pill ───────────────────────────────────────────── */
+  .pill { display:inline-flex; align-items:center; gap:7px; font-family:var(--mono); font-size:10.5px;
+          letter-spacing:0.1em; text-transform:uppercase; padding:5px 11px; border-radius:20px; }
+  .pill.backup   { background:var(--amber-dim); color:var(--amber); border:1px solid rgba(217,164,65,0.45); }
+  .pill.recovery { background:var(--blue-dim);  color:#8fb6ff;      border:1px solid rgba(75,139,245,0.45); }
+  .pill .ttl { color:var(--fg-dim); letter-spacing:0.05em; }
+  .pill-btn { font-family:var(--mono); font-size:11px; letter-spacing:0.04em;
+              padding:5px 11px; border-radius:20px; }
+  .pill-btn.open { background:var(--blue-dim); border-color:rgba(75,139,245,0.45); color:#8fb6ff; }
+
+  .done-badge { display:inline-flex; align-items:center; padding:4px 9px; border-radius:5px; font-size:11.5px; }
+  .done-badge.ok  { background:var(--green-dim); color:var(--green); border:1px solid rgba(63,185,80,0.35); }
+  .done-badge.err { background:var(--red-dim); color:#f0857c; border:1px solid rgba(248,81,73,0.4); }
+
+  /* ── backups: groups & versions ───────────────────────────── */
+  .mach-name { display:flex; align-items:center; gap:9px; }
+  .mach-sub { font-size:11.5px; margin-top:2px; color:var(--fg-mute); }
+  .mach-sub.off { color:var(--amber); opacity:0.75; }
+  .rename-box { display:flex; align-items:center; gap:6px; }
+  .rename-box input { background:var(--panel-2); color:var(--fg); border:1px solid var(--blue);
+                      border-radius:4px; padding:4px 7px; font:inherit; font-size:13px; width:20ch; }
+  .rename-box input:focus { outline:none; }
+  tr.vers > td { padding:0 14px 14px; background:var(--panel); border-bottom:1px solid var(--line-soft); }
+  ul.versions { list-style:none; margin:0; padding:0; border:1px solid var(--line); border-radius:6px;
+                overflow:hidden; background:var(--bg); }
+  ul.versions li { display:flex; align-items:center; gap:12px; padding:9px 13px;
+                   border-bottom:1px solid var(--line-soft); font-size:12.5px; }
+  ul.versions li:last-child { border-bottom:none; }
+  ul.versions li .vid { flex:1; min-width:0; font-size:11.5px; color:var(--fg-dim);
+                        overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  ul.versions li .vdate, ul.versions li .vsize { font-family:var(--mono); font-size:11.5px;
+                        color:var(--fg-mute); white-space:nowrap; }
+  ul.versions li .vsize { min-width:170px; text-align:right; }
+  .vtag { font-family:var(--mono); font-size:10.5px; letter-spacing:0.06em;
+          padding:2px 7px; border-radius:3px; background:var(--panel-2); color:var(--fg-mute);
+          border:1px solid var(--line); flex-shrink:0; }
+  .vtag.latest { background:var(--green-dim); color:var(--green); border-color:rgba(63,185,80,0.35); }
+
+  .progress { display:flex; flex-direction:column; gap:4px; min-width:170px; }
+  .progress .bar { position:relative; height:5px; background:var(--panel-2); border-radius:3px; overflow:hidden; }
+  .progress .fill { height:100%; background:var(--blue); transition:width 1s ease; }
+  .progress .label { font-family:var(--mono); font-size:11px; color:var(--fg-mute); }
+  .progress.indeterminate .fill { width:30% !important; animation:indet 1.4s ease-in-out infinite; }
   @keyframes indet { 0%{ transform:translateX(-100%);} 100%{ transform:translateX(330%);} }
-  .modal ul.imgs .name { font-family: ui-monospace, monospace; font-size:13px; color:#ddd; }
-  .modal ul.imgs .meta { font-size:11px; color:#888; font-variant-numeric: tabular-nums; }
-  .modal ul.imgs .badge { font-size:10px; background:rgba(63,185,80,0.15); color:#3fb950; padding:2px 6px; border-radius:3px; text-transform:uppercase; letter-spacing:0.05em; }
+
+  /* ── modals ───────────────────────────────────────────────── */
+  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,0.72); display:none;
+              align-items:center; justify-content:center; z-index:10; padding:24px; }
+  .modal-bg.show { display:flex; }
+  .modal { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:22px;
+           width:560px; max-width:100%; max-height:84vh; overflow:auto; }
+  .modal h2 { margin:0 0 5px; font-size:16px; font-weight:600; }
+  .modal .sub { color:var(--fg-dim); font-size:12px; margin-bottom:16px; }
+  .modal ul.opts { list-style:none; padding:0; margin:0 0 18px; max-height:46vh; overflow:auto; }
+  .modal ul.opts li { padding:11px 13px; border:1px solid var(--line); border-radius:6px; margin-bottom:6px;
+                      display:flex; align-items:center; gap:11px; }
+  .modal ul.opts li[data-name], .modal ul.opts li.pick { cursor:pointer; }
+  .modal ul.opts li[data-name]:hover, .modal ul.opts li.pick:hover { background:var(--panel-2); }
+  .modal ul.opts li.selected { border-color:var(--blue); background:var(--blue-dim); }
+  .modal ul.opts li.empty { border:none; color:var(--fg-mute); }
+  .modal .opt-info { flex:1; min-width:0; }
+  .modal .opt-name { display:flex; align-items:center; gap:8px; font-size:13px; }
+  .modal .opt-meta { font-family:var(--mono); font-size:11px; color:var(--fg-mute); margin-top:2px; }
   .modal .row { display:flex; justify-content:flex-end; gap:8px; }
-  .modal .row button { padding:8px 14px; border-radius:5px; cursor:pointer; font-size:13px; border:1px solid #333; background:#222; color:#ddd; }
-  .modal .row button.primary { background:#1f6feb; border-color:#1f6feb; color:#fff; }
-  .modal .row button:disabled { opacity:0.5; cursor:not-allowed; }
-  .cat-badge { display:inline-block; font-size:10px; padding:1px 6px; border-radius:3px; margin-left:6px; text-transform:uppercase; letter-spacing:0.05em; vertical-align:middle; }
-  .cat-badge.pc    { background:rgba(63,185,80,0.12);  color:#3fb950; border:1px solid rgba(63,185,80,0.35); }
-  .cat-badge.nonpc { background:rgba(248,81,73,0.10);  color:#f0857c; border:1px solid rgba(248,81,73,0.35); }
-  .cat-badge.unknown { background:#222; color:#888; border:1px solid #333; }
-  button.remove-btn { background:transparent; color:#888; border:1px solid #333; padding:4px 9px; }
-  button.remove-btn:hover { background:rgba(248,81,73,0.15); border-color:#f85149; color:#ff9c95; }
-  .done-badge { display:inline-flex; align-items:center; padding:4px 9px; border-radius:5px; font-size:12px; font-weight:500; }
-  .done-badge.ok  { background:rgba(63,185,80,0.12); color:#3fb950; border:1px solid rgba(63,185,80,0.35); }
-  .done-badge.err { background:rgba(248,81,73,0.12); color:#f0857c; border:1px solid rgba(248,81,73,0.40); }
-  button.done-dismiss { background:transparent; color:#888; border:1px solid #333; padding:3px 7px; font-size:11px; margin-left:-3px; border-left:none; border-top-left-radius:0; border-bottom-left-radius:0; }
-  button.done-dismiss:hover { background:#222; color:#ddd; }
-  .addDevices-toolbar { display:flex; gap:8px; margin-bottom:8px; }
-  .addDevices-toolbar .link { background:transparent; border:none; color:#79b8ff; font-size:12px; padding:2px 4px; cursor:pointer; }
-  .addDevices-toolbar .link:hover { text-decoration:underline; }
-  .addDevices-row { display:flex; align-items:center; gap:10px; padding:8px 10px; border:1px solid #2a2a2a; border-radius:5px; margin-bottom:5px; cursor:pointer; }
-  .addDevices-row:hover { background:#1d1d1d; }
-  .addDevices-row.checked { border-color:#1f6feb; background:rgba(31,111,235,0.08); }
-  .addDevices-row input[type=checkbox] { accent-color:#1f6feb; }
-  .addDevices-row .info { flex:1; min-width:0; }
-  .addDevices-row .info .name { font-size:13px; color:#ddd; }
-  .addDevices-row .info .meta { font-size:11px; color:#888; font-family: ui-monospace, monospace; }
-  .addDevices-row .info .name input { background:transparent; color:#ddd; border:1px solid transparent; padding:2px 4px; border-radius:3px; font:inherit; width:100%; max-width:260px; }
-  .addDevices-row .info .name input:hover { border-color:#333; }
-  .addDevices-row .info .name input:focus { outline:none; border-color:#3b82f6; background:#1a1a1a; }
-  .upd-note { font-size:12px; color:#888; line-height:1.5; margin:0 0 14px; }
-  .upd-label { display:block; font-size:12px; color:#aaa; margin-bottom:10px; }
-  .upd-label input { display:block; width:100%; box-sizing:border-box; margin-top:4px; background:#1a1a1a; color:#ddd; border:1px solid #333; border-radius:4px; padding:7px 9px; font:inherit; font-size:13px; }
-  .upd-label input:focus { outline:none; border-color:#3b82f6; }
-  #updateLog { background:#0c0c0c; border:1px solid #2a2a2a; border-radius:5px; padding:10px 12px; margin:0 0 14px; max-height:45vh; min-height:120px; overflow:auto; font-family: ui-monospace, monospace; font-size:12px; line-height:1.5; color:#bbb; white-space:pre-wrap; word-break:break-word; }
-  .upd-state { font-size:12px; margin:0 0 10px; padding:6px 10px; border-radius:5px; display:none; }
-  .upd-state.running { display:block; background:rgba(31,111,235,0.10); border:1px solid rgba(31,111,235,0.4); color:#79b8ff; }
-  .upd-state.ok      { display:block; background:rgba(63,185,80,0.10); border:1px solid rgba(63,185,80,0.35); color:#3fb950; }
-  .upd-state.err     { display:block; background:rgba(248,81,73,0.10); border:1px solid rgba(248,81,73,0.40); color:#f0857c; }
+  .modal .row button { padding:8px 15px; font-size:13px; }
+  .opts-toolbar { display:flex; gap:10px; margin-bottom:9px; }
+  .modal ul.opts li input[type=checkbox] { accent-color:var(--blue); }
+  .modal ul.opts li .opt-name input[type=text] { background:transparent; color:var(--fg);
+        border:1px solid transparent; border-radius:4px; padding:2px 5px; font:inherit; width:22ch; }
+  .modal ul.opts li .opt-name input[type=text]:hover { border-color:var(--line); }
+  .modal ul.opts li .opt-name input[type=text]:focus { outline:none; border-color:var(--blue); background:var(--panel-2); }
+
+  .field { display:block; font-family:var(--mono); font-size:10px; letter-spacing:0.14em;
+           text-transform:uppercase; color:var(--fg-mute); margin-bottom:12px; }
+  .field input { display:block; width:100%; margin-top:6px; background:var(--bg); color:var(--fg);
+                 border:1px solid var(--line); border-radius:5px; padding:8px 10px;
+                 font-family:var(--sans); font-size:13px; letter-spacing:normal; text-transform:none; }
+  .field input:focus { outline:none; border-color:var(--blue); }
+  .note { font-size:12px; color:var(--fg-dim); line-height:1.6; margin:0 0 16px; }
+  #updateLog { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:11px 13px;
+               margin:0 0 14px; max-height:44vh; min-height:130px; overflow:auto;
+               font-family:var(--mono); font-size:11.5px; line-height:1.55; color:var(--fg-dim);
+               white-space:pre-wrap; word-break:break-word; }
+  .upd-state { font-size:12px; margin:0 0 12px; padding:7px 11px; border-radius:5px; display:none; }
+  .upd-state.running { display:block; background:var(--blue-dim); border:1px solid rgba(75,139,245,0.45); color:#8fb6ff; }
+  .upd-state.ok      { display:block; background:var(--green-dim); border:1px solid rgba(63,185,80,0.35); color:var(--green); }
+  .upd-state.err     { display:block; background:var(--red-dim); border:1px solid rgba(248,81,73,0.4); color:#f0857c; }
+
+  #toast { position:fixed; bottom:24px; right:24px; background:var(--panel); border:1px solid var(--line);
+           padding:12px 16px; border-radius:6px; font-size:13px; opacity:0; transition:opacity .2s;
+           max-width:400px; pointer-events:none; }
+  #toast.show { opacity:1; }
+  #toast.err { border-color:var(--red); }
+  #toast.ok  { border-color:var(--green); }
 </style>
 </head>
 <body>
-  <div class="header">
+<div class="wrap">
+  <div class="topbar">
     <div>
-      <div class="brand">FTD Aero Recovery Center <span id="versionTag" style="font-weight:400;font-size:0.85em"></span></div>
+      <div class="eyebrow">FTD Aero Recovery Center<span id="versionTag"></span></div>
       <h1>Recovery Status</h1>
-      <div class="sub" id="meta">Loading…</div>
+      <div class="statusline mono" id="meta">Loading…</div>
     </div>
-    <div style="display:flex; gap:8px;">
-      <button class="scan" id="updateBtn">Update</button>
-      <button class="scan" id="addDevicesBtn">+ Add backup devices</button>
+    <div class="topbar-actions">
+      <button id="updateBtn">Update</button>
+      <button id="addDevicesBtn">+ Add backup devices</button>
     </div>
   </div>
-  <div class="banner" id="storageBanner"></div>
+
+  <div class="diskstrip" id="storageBanner"></div>
   <div class="banner" id="warnBanner"></div>
-  <div class="modal-bg" id="restoreModal">
-    <div class="modal">
-      <h2>Restore which image?</h2>
-      <div class="sub" id="restoreModalSub"></div>
-      <ul class="imgs" id="restoreList"></ul>
-      <div class="row">
-        <button id="restoreCancel">Cancel</button>
-        <button id="restoreConfirm" class="primary" disabled>Arm restore</button>
-      </div>
-    </div>
-  </div>
-  <div class="modal-bg" id="addDevicesModal">
-    <div class="modal">
-      <h2>Add backup devices</h2>
-      <div class="sub" id="addDevicesSub">Scanning network…</div>
-      <div class="addDevices-toolbar">
-        <button id="addDevicesSelectAll" class="link">Select all</button>
-        <button id="addDevicesSelectPcs" class="link">Select PCs only</button>
-        <button id="addDevicesSelectNone" class="link">Clear</button>
-      </div>
-      <ul class="imgs" id="addDevicesList"></ul>
-      <div class="row">
-        <button id="addDevicesCancel">Cancel</button>
-        <button id="addDevicesConfirm" class="primary" disabled>Add selected</button>
-      </div>
-    </div>
-  </div>
-  <div class="modal-bg" id="updateModal">
-    <div class="modal">
-      <h2>Software update</h2>
-      <div class="sub" id="updateSub">Pulls the latest version from the FTD GitLab and installs it.</div>
-      <div id="updateForm">
-        <p class="upd-note">
-          Devices outside the company network connect through the company VPN
-          (L2TP/IPsec) for the duration of the update and disconnect right
-          after. Your credentials are used once for that connection and are
-          never stored. Inside the company network the fields can be left
-          empty.
-        </p>
-        <label class="upd-label">VPN username
-          <input type="text" id="vpnUser" autocomplete="off" spellcheck="false">
-        </label>
-        <label class="upd-label">VPN password
-          <input type="password" id="vpnPass" autocomplete="off">
-        </label>
-      </div>
-      <div class="upd-state" id="updateState"></div>
-      <pre id="updateLog" style="display:none"></pre>
-      <div class="row">
-        <button id="updateAbort" style="display:none">Abort update</button>
-        <button id="updateClose">Close</button>
-        <button id="updateStartBtn" class="primary">Start update</button>
-      </div>
-    </div>
-  </div>
-  <table>
-    <thead><tr>
-      <th>Status</th><th>Name</th><th>IP</th><th>MAC</th><th>Latency</th><th>Last Backup</th><th>Actions</th>
-    </tr></thead>
-    <tbody id="rows"></tbody>
-  </table>
-  <section class="backups">
-    <h2>Backups</h2>
+
+  <section>
+    <h2 class="sec-head">Devices</h2>
     <table>
       <thead><tr>
-        <th>Host</th><th>Image</th><th>Date</th><th>Size</th><th>Actions</th>
+        <th>Device</th><th>Last backup</th><th>Images</th><th class="ta-r">Actions</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2 class="sec-head">Backups</h2>
+    <table>
+      <thead><tr>
+        <th>Machine</th><th>MAC address</th><th>Latest</th><th>Size</th><th class="ta-r">Actions</th>
       </tr></thead>
       <tbody id="backupRows"></tbody>
     </table>
   </section>
-  <div id="toast"></div>
+</div>
+
+<div class="modal-bg" id="restoreModal">
+  <div class="modal">
+    <h2>Restore which image?</h2>
+    <div class="sub" id="restoreModalSub"></div>
+    <ul class="opts" id="restoreList"></ul>
+    <div class="row">
+      <button id="restoreCancel">Cancel</button>
+      <button id="restoreConfirm" class="primary" disabled>Arm restore</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="addDevicesModal">
+  <div class="modal">
+    <h2>Add backup devices</h2>
+    <div class="sub" id="addDevicesSub">Scanning network…</div>
+    <div class="opts-toolbar">
+      <button id="addDevicesSelectAll" class="linkbtn">Select all</button>
+      <button id="addDevicesSelectPcs" class="linkbtn">Select PCs only</button>
+      <button id="addDevicesSelectNone" class="linkbtn">Clear</button>
+    </div>
+    <ul class="opts" id="addDevicesList"></ul>
+    <div class="row">
+      <button id="addDevicesCancel">Cancel</button>
+      <button id="addDevicesConfirm" class="primary" disabled>Add selected</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="updateModal">
+  <div class="modal">
+    <h2>Software update</h2>
+    <div class="sub">Pulls the latest version from the FTD server and installs it.</div>
+    <div id="updateForm">
+      <p class="note">
+        The update connects through the company VPN (L2TP/IPsec), pulls the
+        latest version from the FTD server and disconnects right after. The
+        credentials are used once for that connection and are never stored.
+        Inside the company network both fields may be left empty.
+      </p>
+      <label class="field">VPN username
+        <input type="text" id="vpnUser" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="field">VPN password
+        <input type="password" id="vpnPass" autocomplete="off">
+      </label>
+    </div>
+    <div class="upd-state" id="updateState"></div>
+    <pre id="updateLog" style="display:none"></pre>
+    <div class="row">
+      <button id="updateAbort" style="display:none">Abort update</button>
+      <button id="updateClose">Close</button>
+      <button id="updateStartBtn" class="primary">Connect &amp; update</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
 
 <script>
 let serverNow = 0;
 let lastFetch = 0;
+let lastDeviceCount = 0;
+let lastImageCount = 0;
+let lastCheckedAt = 0;
+const openGroups = new Set();   // MACs whose version list is expanded
+let renamingMac = null;         // MAC whose name cell is in edit mode
 
 function toast(msg, kind) {
   const t = document.getElementById('toast');
@@ -1879,6 +2136,40 @@ function fmtRelative(secs) {
   return Math.floor(secs / (86400 * 365)) + 'y ago';
 }
 
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024**2) return (n/1024).toFixed(1) + ' KB';
+  if (n < 1024**3) return (n/1024**2).toFixed(1) + ' MB';
+  return (n/1024**3).toFixed(1) + ' GB';
+}
+
+function fmtDate(ts) {
+  return new Date(ts * 1000).toLocaleString([], {
+    year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit'
+  });
+}
+
+function plural(n, word) { return n + ' ' + word + (n === 1 ? '' : 's'); }
+
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function renderMeta() {
+  if (!lastCheckedAt) return;
+  document.getElementById('meta').textContent =
+    'Last check ' + new Date(lastCheckedAt * 1000).toLocaleTimeString() +
+    ' · ' + plural(lastDeviceCount, 'device') +
+    ' · ' + plural(lastImageCount, 'image');
+}
+
+// ── device actions ───────────────────────────────────────────────────────
 async function saveName(ip, input) {
   const newName = input.value.trim();
   if (!newName || newName === input.dataset.original) {
@@ -1913,16 +2204,6 @@ async function wake(ip, btn) {
   finally { btn.textContent = orig; btn.disabled = false; }
 }
 
-async function shutdown(ip, btn) {
-  if (!window.confirm(`Send shutdown signal to ${ip}?`)) return;
-  btn.disabled = true; const orig = btn.textContent; btn.textContent = '…';
-  try {
-    await fetch(`http://${ip}:8887/shutdown`, { method: 'POST', mode: 'no-cors' });
-    toast(`Shutdown requested → ${ip}`, 'ok');
-  } catch (e) { toast('Error: ' + e.message, 'err'); }
-  finally { btn.textContent = orig; btn.disabled = false; }
-}
-
 async function arm(ip, mode, btn, image) {
   btn.disabled = true; const orig = btn.textContent; btn.textContent = '…';
   try {
@@ -1941,61 +2222,81 @@ async function arm(ip, mode, btn, image) {
   finally { btn.textContent = orig; btn.disabled = false; }
 }
 
-function fmtBytes(n) {
-  if (n < 1024) return n + ' B';
-  if (n < 1024**2) return (n/1024).toFixed(1) + ' KB';
-  if (n < 1024**3) return (n/1024**2).toFixed(1) + ' MB';
-  return (n/1024**3).toFixed(1) + ' GB';
+async function disarm(ip, btn) {
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = '…';
+  try {
+    const r = await fetch(`/api/host/${encodeURIComponent(ip)}/mode`, { method: 'DELETE' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'disarm failed');
+    toast('Disarmed', 'ok');
+    refresh();
+  } catch (e) { toast('Error: ' + e.message, 'err'); }
+  finally { btn.textContent = orig; btn.disabled = false; }
 }
 
-function escapeHtml(s) {
-  if (s == null) return '';
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+async function dismissProgress(mac, btn) {
+  if (!mac) return;
+  btn.disabled = true;
+  try {
+    await fetch(`/api/progress/${encodeURIComponent(mac)}`, { method: 'DELETE' });
+    refresh();
+  } catch (e) { toast('Error: ' + e.message, 'err'); btn.disabled = false; }
 }
 
-async function openRestorePicker(host, btn) {
-  const modal = document.getElementById('restoreModal');
-  const list = document.getElementById('restoreList');
-  const sub = document.getElementById('restoreModalSub');
+async function removeHost(ip, btn) {
+  if (!window.confirm(`Remove ${ip} from the backup list? (Backup images already on disk are kept.)`)) return;
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/host/${encodeURIComponent(ip)}`, { method: 'DELETE' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'remove failed');
+    toast(`Removed ${d.removed.name || ip}`, 'ok');
+    refresh();
+  } catch (e) { toast('Error: ' + e.message, 'err'); btn.disabled = false; }
+}
+
+// ── restore picker ───────────────────────────────────────────────────────
+function versionTag(img, isOwn) {
+  const v = 'v' + (img.version || 1);
+  if (isOwn) return `<span class="vtag latest">THIS HOST · ${v}</span>`;
+  if (img.version === img.version_count && img.version_count > 1)
+    return `<span class="vtag latest">${v} · latest</span>`;
+  return `<span class="vtag">${v}</span>`;
+}
+
+async function openRestorePicker(host, btn, presetImage) {
+  const modal   = document.getElementById('restoreModal');
+  const list    = document.getElementById('restoreList');
+  const sub     = document.getElementById('restoreModalSub');
   const confirm = document.getElementById('restoreConfirm');
-  const cancel = document.getElementById('restoreCancel');
-  sub.textContent = `Target: ${host.name} (${host.host}) — MAC ${host.mac || '?'}`;
-  list.innerHTML = '<li class="muted">Loading…</li>';
+  const cancel  = document.getElementById('restoreCancel');
+  sub.textContent = [host.name, host.host, host.mac || 'MAC unknown'].join(' · ');
+  list.innerHTML = '<li class="empty">Loading…</li>';
   modal.classList.add('show');
   confirm.disabled = true;
   const close = () => modal.classList.remove('show');
   cancel.onclick = close;
   modal.onclick = e => { if (e.target === modal) close(); };
   let selected = null;
+  const select = (name) => { selected = name; confirm.disabled = !name; };
   try {
     const r = await fetch('/api/images', { cache: 'no-store' });
     const d = await r.json();
     if (!d.images.length) {
-      list.innerHTML = '<li class="muted">No images available.</li>';
+      list.innerHTML = '<li class="empty">No images available.</li>';
       return;
     }
-    const ownMac = (host.mac || '').toLowerCase().replace(/:/g,'-');
-    const ownPrefix = ownMac ? `img-${ownMac}` : null;
-    const isMatching = (img) => ownPrefix && (img.name === ownPrefix || img.name.startsWith(ownPrefix + '-'));
+    const ownMac = (host.mac || '').toLowerCase();
+    const isOwn = (img) => !!ownMac && img.mac === ownMac;
     list.innerHTML = d.images.map(img => {
-      const isOwn = isMatching(img);
-      const date = new Date(img.mtime * 1000).toLocaleString();
-      const hostLine = img.host_name
-        ? `<div class="name">${escapeHtml(img.host_name)} <span class="meta">(${escapeHtml(img.host_ip)})</span></div>`
-        : `<div class="name">${escapeHtml(img.name)}</div>`;
-      const metaBits = [date, fmtBytes(img.size_bytes)];
+      const label = img.machine_name || img.name;
+      const metaBits = [fmtDate(img.mtime), fmtBytes(img.size_bytes)];
       if (img.mac) metaBits.push(img.mac);
-      if (img.host_name) metaBits.push(img.name);
       return `
-        <li data-name="${img.name}" ${isOwn ? 'class="selected"' : ''}>
-          <div>
-            ${hostLine}${isOwn ? ' <span class="badge">this host</span>' : ''}
-            <div class="meta">${metaBits.join(' · ')}</div>
+        <li data-name="${escapeHtml(img.name)}">
+          <div class="opt-info">
+            <div class="opt-name">${escapeHtml(label)} ${versionTag(img, isOwn(img))}</div>
+            <div class="opt-meta">${escapeHtml(metaBits.join(' · '))}</div>
           </div>
         </li>`;
     }).join('');
@@ -2003,18 +2304,21 @@ async function openRestorePicker(host, btn) {
       li.addEventListener('click', () => {
         list.querySelectorAll('li').forEach(x => x.classList.remove('selected'));
         li.classList.add('selected');
-        selected = li.dataset.name;
-        confirm.disabled = false;
+        select(li.dataset.name);
       });
     });
-    // Pre-select the newest image matching this host (api_images returns newest-first)
-    const ownMatch = d.images.find(isMatching);
-    if (ownMatch) {
-      selected = ownMatch.name;
-      confirm.disabled = false;
+    // Pre-select: an explicitly requested version, else this host's newest image
+    // (api_images returns newest-first).
+    const preset = presetImage
+      ? d.images.find(i => i.name === presetImage)
+      : d.images.find(isOwn);
+    if (preset) {
+      select(preset.name);
+      const li = list.querySelector(`li[data-name="${CSS.escape(preset.name)}"]`);
+      if (li) li.classList.add('selected');
     }
   } catch (e) {
-    list.innerHTML = '<li class="muted">Error loading images: ' + e.message + '</li>';
+    list.innerHTML = '<li class="empty">Error loading images: ' + escapeHtml(e.message) + '</li>';
   }
   confirm.onclick = () => {
     if (!selected) return;
@@ -2033,18 +2337,7 @@ async function openRestorePicker(host, btn) {
   };
 }
 
-async function disarm(ip, btn) {
-  btn.disabled = true; const orig = btn.textContent; btn.textContent = '…';
-  try {
-    const r = await fetch(`/api/host/${encodeURIComponent(ip)}/mode`, { method: 'DELETE' });
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.detail || 'disarm failed');
-    toast('Disarmed', 'ok');
-    refresh();
-  } catch (e) { toast('Error: ' + e.message, 'err'); }
-  finally { btn.textContent = orig; btn.disabled = false; }
-}
-
+// ── devices table ────────────────────────────────────────────────────────
 function buildActionsCell(h, storageOk) {
   // Only block actions while the job is actively running. Terminal states
   // (completed/failed) show a small badge alongside the normal buttons so the
@@ -2054,17 +2347,16 @@ function buildActionsCell(h, storageOk) {
   if (h.armed) {
     const m = h.armed.mode;
     const remaining = Math.max(0, h.armed.expires_at - serverNow);
+    const verb = m === 'recovery' ? 'Restore' : 'Backup';
     return `
       <div class="actions">
-        <span class="armed ${m}" data-expires="${h.armed.expires_at}">
-          ${m.toUpperCase()} armed
-          <span class="ttl">${fmtTtl(remaining)}</span>
+        <span class="pill ${m}" data-expires="${h.armed.expires_at}">
+          ${verb} armed <span class="ttl">· ${fmtTtl(remaining)}</span>
         </span>
         <button class="disarm" data-ip="${h.host}" data-action="disarm">Disarm</button>
       </div>`;
   }
   const macAttr = h.mac ? '' : 'disabled title="No MAC known"';
-  const onAttr = h.online ? '' : 'disabled title="Host offline"';
   const backupAttr = h.mac
     ? (storageOk ? '' : 'disabled title="Backup storage offline — fix the storage banner first"')
     : 'disabled title="No MAC known"';
@@ -2074,21 +2366,20 @@ function buildActionsCell(h, storageOk) {
     const verb = phase === 'restore' ? 'Restore' : (phase === 'backup' ? 'Backup' : 'Job');
     if (p.status === 'completed') {
       terminalBadge = `<span class="done-badge ok" title="${verb} completed">✓ ${verb} done</span>
-        <button class="done-dismiss" data-ip="${h.host}" data-mac="${h.mac || ''}" data-action="dismiss-progress" title="Dismiss">✕</button>`;
+        <button class="icon" data-ip="${h.host}" data-mac="${h.mac || ''}" data-action="dismiss-progress" title="Dismiss">✕</button>`;
     } else {
       const rc = p.rc != null ? ` (rc=${p.rc})` : '';
       terminalBadge = `<span class="done-badge err" title="${verb} failed${rc}">✗ ${verb} failed${rc}</span>
-        <button class="done-dismiss" data-ip="${h.host}" data-mac="${h.mac || ''}" data-action="dismiss-progress" title="Dismiss">✕</button>`;
+        <button class="icon" data-ip="${h.host}" data-mac="${h.mac || ''}" data-action="dismiss-progress" title="Dismiss">✕</button>`;
     }
   }
   return `
     <div class="actions">
       ${terminalBadge}
-      <button class="wol"      data-ip="${h.host}" data-action="wol"      ${macAttr}>Wake</button>
-      <button class="recovery" data-ip="${h.host}" data-action="recovery" ${macAttr}>Recovery</button>
-      <button class="backup"   data-ip="${h.host}" data-action="backup"   ${backupAttr}>Backup</button>
-      <button class="shutdown" data-ip="${h.host}" data-action="shutdown" ${onAttr}>Shutdown</button>
-      <button class="remove-btn" data-ip="${h.host}" data-action="remove" title="Remove from backup list">Remove</button>
+      <button data-ip="${h.host}" data-action="wol"      ${macAttr}>Wake</button>
+      <button data-ip="${h.host}" data-action="recovery" ${macAttr}>Restore</button>
+      <button data-ip="${h.host}" data-action="backup"   ${backupAttr}>Backup</button>
+      <button class="icon danger" data-ip="${h.host}" data-action="remove" title="Remove from backup list">✕</button>
     </div>`;
 }
 
@@ -2101,36 +2392,54 @@ async function refresh() {
     const r = await fetch('/api/status', { cache: 'no-store' });
     const d = await r.json();
     serverNow = d.now; lastFetch = Date.now() / 1000;
+    lastCheckedAt = d.checked_at;
+    lastDeviceCount = d.hosts.length;
+    // Backup groups are keyed by MAC; this is how a group finds the live host
+    // it can be restored onto.
+    window._hostsByMac = {};
+    d.hosts.forEach(h => { if (h.mac) window._hostsByMac[h.mac] = h; });
     const rows = document.getElementById('rows');
     if (!d.hosts.length) {
-      rows.innerHTML = '<tr><td colspan="7" class="muted">No devices in the backup list yet. Click "Add backup devices" to scan and pick.</td></tr>';
+      rows.innerHTML = '<tr><td colspan="4" class="empty">No devices in the backup list yet. Click "+ Add backup devices" to scan and pick.</td></tr>';
     } else {
       const storageOk = !!(d.storage && d.storage.ok);
       rows.innerHTML = d.hosts.map(h => {
-        const macCell = h.mac
-          ? `<span class="mac">${h.mac}</span>${h.mac_source === 'arp' ? ' <span class="muted">(arp)</span>' : ''}`
-          : '<span class="muted">—</span>';
-        const latencyCell = h.latency_ms != null ? h.latency_ms.toFixed(2) + ' ms' : '<span class="muted">—</span>';
-        const backupCell = h.last_backup_at
-          ? `<span class="latency" title="${new Date(h.last_backup_at * 1000).toLocaleString()}">${fmtRelative(serverNow - h.last_backup_at)}</span>`
-          : '<span class="muted">never</span>';
         const safeName = escapeHtml(h.name);
-        const catBadge = h.category === 'pc' ? '<span class="cat-badge pc" title="MAC vendor is a known PC NIC">PC</span>'
-                       : h.category === 'nonpc' ? '<span class="cat-badge nonpc" title="MAC vendor is a known non-PC device">non-PC</span>'
-                       : '';
+        const tag = h.category === 'pc'
+          ? '<span class="tag pc" title="MAC vendor is a known PC NIC">PC</span>' : '';
+        const subBits = [h.host];
+        if (h.mac) subBits.push(h.mac + (h.mac_source === 'arp' ? ' (arp)' : ''));
+        else subBits.push('no MAC');
+        if (h.latency_ms != null) subBits.push(h.latency_ms.toFixed(1) + ' ms');
+        const backupCell = h.last_backup_at
+          ? `<span class="mono" title="${escapeHtml(new Date(h.last_backup_at * 1000).toLocaleString())}">${fmtRelative(serverNow - h.last_backup_at)}</span>`
+          : '<span class="muted">never</span>';
+        const imagesCell = h.image_count
+          ? `<span class="mono">${plural(h.image_count, 'image')}</span>`
+          : '<span class="muted">—</span>';
         return `
           <tr class="${h.online ? 'online' : 'offline'}">
-            <td><span class="dot"></span>${h.online ? 'Online' : 'Offline'}</td>
-            <td><input class="name-edit" data-ip="${h.host}" data-original="${safeName}" value="${safeName}">${catBadge}</td>
-            <td class="mac">${h.host}</td>
-            <td>${macCell}</td>
-            <td class="latency">${latencyCell}</td>
+            <td>
+              <div class="dev">
+                <span class="dot" title="${h.online ? 'Online' : 'Offline'}"></span>
+                <div>
+                  <div class="dev-name">
+                    <input class="name-edit" data-ip="${h.host}" data-original="${safeName}" value="${safeName}" size="1">${tag}
+                  </div>
+                  <div class="dev-sub">${escapeHtml(subBits.join(' · '))}</div>
+                </div>
+              </div>
+            </td>
             <td>${backupCell}</td>
-            <td>${buildActionsCell(h, storageOk)}</td>
+            <td>${imagesCell}</td>
+            <td class="ta-r">${buildActionsCell(h, storageOk)}</td>
           </tr>`;
       }).join('');
 
       rows.querySelectorAll('.name-edit').forEach(inp => {
+        const fit = () => { inp.style.width = Math.max(8, Math.min(26, inp.value.length + 1)) + 'ch'; };
+        fit();
+        inp.addEventListener('input', fit);
         inp.addEventListener('blur', () => saveName(inp.dataset.ip, inp));
         inp.addEventListener('keydown', e => {
           if (e.key === 'Enter') { e.preventDefault(); inp.blur(); }
@@ -2141,7 +2450,6 @@ async function refresh() {
         btn.addEventListener('click', () => {
           const a = btn.dataset.action, ip = btn.dataset.ip;
           if (a === 'wol') wake(ip, btn);
-          else if (a === 'shutdown') shutdown(ip, btn);
           else if (a === 'disarm') disarm(ip, btn);
           else if (a === 'remove') removeHost(ip, btn);
           else if (a === 'dismiss-progress') dismissProgress(btn.dataset.mac, btn);
@@ -2153,13 +2461,12 @@ async function refresh() {
         });
       });
     }
-    document.getElementById('meta').textContent =
-      'Last check: ' + new Date(d.checked_at * 1000).toLocaleTimeString();
+    renderMeta();
     const banner = document.getElementById('storageBanner');
     const s = d.storage || {};
     window._lastStorage = s;
     if (!s.ok) {
-      banner.className = 'banner err';
+      banner.className = 'diskstrip bad';
       banner.textContent = `⚠ Backup drive offline — ${s.error || 'unknown error'}. Backups are paused.`;
     } else {
       renderStorageBanner(banner, s);
@@ -2174,7 +2481,7 @@ async function refresh() {
 // Update armed countdowns once per second (without re-fetching).
 setInterval(() => {
   const now = serverNow + (Date.now() / 1000 - lastFetch);
-  document.querySelectorAll('.armed').forEach(el => {
+  document.querySelectorAll('.pill[data-expires]').forEach(el => {
     const remaining = Math.max(0, parseFloat(el.dataset.expires) - now);
     const ttl = el.querySelector('.ttl');
     if (ttl) ttl.textContent = fmtTtl(remaining);
@@ -2182,27 +2489,223 @@ setInterval(() => {
   });
 }, 1000);
 
-async function dismissProgress(mac, btn) {
-  if (!mac) return;
-  btn.disabled = true;
-  try {
-    await fetch(`/api/progress/${encodeURIComponent(mac)}`, { method: 'DELETE' });
-    refresh();
-  } catch (e) { toast('Error: ' + e.message, 'err'); btn.disabled = false; }
+// ── backups table (grouped by MAC, newest version first) ─────────────────
+function groupImages(images) {
+  const groups = new Map();
+  images.forEach(img => {
+    const key = img.mac || ('name:' + img.name);
+    let g = groups.get(key);
+    if (!g) {
+      g = { key, mac: img.mac, images: [], machine_name: null, on_network: false, host_ip: null };
+      groups.set(key, g);
+    }
+    g.images.push(img);
+    if (img.machine_name && !g.machine_name) g.machine_name = img.machine_name;
+    if (img.on_network) { g.on_network = true; g.host_ip = img.host_ip; }
+  });
+  groups.forEach(g => {
+    g.images.sort((a, b) => b.mtime - a.mtime);   // newest version first
+    g.latest = g.images[0];
+  });
+  return [...groups.values()].sort((a, b) => b.latest.mtime - a.latest.mtime);
 }
 
-async function removeHost(ip, btn) {
-  if (!window.confirm(`Remove ${ip} from the backup list? (Backup images already on disk are kept.)`)) return;
-  btn.disabled = true; const orig = btn.textContent; btn.textContent = '…';
+function sizeCellHtml(img) {
+  if (img.in_progress && img.estimated_percent != null) {
+    const pct = img.estimated_percent.toFixed(1);
+    return `
+      <div class="progress">
+        <div class="bar"><div class="fill" style="width:${pct}%"></div></div>
+        <div class="label">${fmtBytes(img.size_bytes)} / ~${fmtBytes(img.reference_size)} · ${pct}%</div>
+      </div>`;
+  }
+  if (img.in_progress) {
+    return `
+      <div class="progress indeterminate">
+        <div class="bar"><div class="fill"></div></div>
+        <div class="label">${fmtBytes(img.size_bytes)} · running (no prior backup for reference)</div>
+      </div>`;
+  }
+  return `<span class="mono">${fmtBytes(img.size_bytes)}</span>`;
+}
+
+function machineCellHtml(g) {
+  const name = g.machine_name || g.latest.name;
+  if (renamingMac === g.key) {
+    return `
+      <div class="rename-box">
+        <input type="text" class="rename-input" value="${escapeHtml(name)}" maxlength="64">
+        <button data-action="rename-save">Save</button>
+        <button data-action="rename-cancel">Cancel</button>
+      </div>`;
+  }
+  const sub = g.on_network
+    ? `<div class="mach-sub">on the network · ${escapeHtml(g.host_ip || '')}</div>`
+    : '<div class="mach-sub off">not on the network · name kept from backup</div>';
+  const renameBtn = g.mac
+    ? '<button class="linkbtn" data-action="rename">rename</button>'
+    : '';
+  return `
+    <div class="mach-name"><span>${escapeHtml(name)}</span>${renameBtn}</div>
+    ${sub}`;
+}
+
+async function saveMachineName(mac, name) {
   try {
-    const r = await fetch(`/api/host/${encodeURIComponent(ip)}`, { method: 'DELETE' });
+    const r = await fetch(`/api/machine/${encodeURIComponent(mac)}/name`, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name})
+    });
     const d = await r.json();
-    if (!r.ok) throw new Error(d.detail || 'remove failed');
-    toast(`Removed ${d.removed.name || ip}`, 'ok');
-    refresh();
-  } catch (e) { toast('Error: ' + e.message, 'err'); btn.textContent = orig; btn.disabled = false; }
+    if (!r.ok) throw new Error(d.detail || 'rename failed');
+    toast('Renamed to ' + d.name, 'ok');
+  } catch (e) { toast('Error: ' + e.message, 'err'); }
 }
 
+async function deleteImage(name) {
+  if (!window.confirm(`Permanently delete image "${name}"? This cannot be undone.`)) return;
+  try {
+    const r = await fetch(`/api/images/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.detail || 'delete failed');
+    toast(`Deleted ${name}`, 'ok');
+    refreshBackups();
+    refresh();
+  } catch (err) { toast('Error: ' + err.message, 'err'); }
+}
+
+async function refreshBackups() {
+  let d;
+  try {
+    const r = await fetch('/api/images', { cache: 'no-store' });
+    d = await r.json();
+  } catch (e) { return; }
+  lastImageCount = d.images.length;
+  renderMeta();
+  const rows = document.getElementById('backupRows');
+  if (!d.images.length) {
+    rows.innerHTML = '<tr><td colspan="5" class="empty">No backups yet.</td></tr>';
+    return;
+  }
+  const groups = groupImages(d.images);
+  rows.innerHTML = groups.map(g => {
+    const expanded = openGroups.has(g.key);
+    const n = g.images.length;
+    const restoreAttr = g.on_network ? '' : 'disabled title="Machine is not on the network"';
+    const versions = g.images.map(img => {
+      const isLatest = img === g.latest;
+      return `
+        <li>
+          <span class="vtag ${isLatest ? 'latest' : ''}">v${img.version || 1}</span>
+          <span class="vid mono">${escapeHtml(img.name)}</span>
+          <span class="vdate">${fmtDate(img.mtime)}</span>
+          <div class="vsize">${sizeCellHtml(img)}</div>
+          <button data-action="restore-version" data-key="${escapeHtml(g.key)}" data-name="${escapeHtml(img.name)}" ${restoreAttr}>Restore</button>
+          <button class="icon danger" data-action="delete-image" data-name="${escapeHtml(img.name)}" title="Delete this image">✕</button>
+        </li>`;
+    }).join('');
+    return `
+      <tr data-key="${escapeHtml(g.key)}">
+        <td>${machineCellHtml(g)}</td>
+        <td class="mono">${escapeHtml(g.mac || '—')}</td>
+        <td class="mono">${fmtDate(g.latest.mtime)}</td>
+        <td>${sizeCellHtml(g.latest)}</td>
+        <td class="ta-r"><div class="actions">
+          <button data-action="restore-version" data-key="${escapeHtml(g.key)}" data-name="${escapeHtml(g.latest.name)}" ${restoreAttr}>Restore</button>
+          <button class="pill-btn ${expanded ? 'open' : ''}" data-action="toggle" data-key="${escapeHtml(g.key)}">${plural(n, 'version')}</button>
+        </div></td>
+      </tr>
+      <tr class="vers" data-key="${escapeHtml(g.key)}" ${expanded ? '' : 'hidden'}>
+        <td colspan="5"><ul class="versions">${versions}</ul></td>
+      </tr>`;
+  }).join('');
+
+  const groupByKey = new Map(groups.map(g => [g.key, g]));
+  const commitRename = (g, value) => {
+    renamingMac = null;
+    const name = (value || '').trim();
+    const current = g.machine_name || g.latest.name;
+    if (name && name !== current) {
+      saveMachineName(g.mac, name).then(refreshBackups);
+    } else {
+      refreshBackups();
+    }
+  };
+
+  rows.querySelectorAll('button[data-action]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const a = btn.dataset.action;
+      const g = groupByKey.get(btn.dataset.key);
+      if (a === 'toggle') {
+        if (openGroups.has(g.key)) openGroups.delete(g.key); else openGroups.add(g.key);
+        refreshBackups();
+      } else if (a === 'rename') {
+        renamingMac = g.key;
+        refreshBackups();
+      } else if (a === 'rename-cancel') {
+        renamingMac = null;
+        refreshBackups();
+      } else if (a === 'rename-save') {
+        commitRename(g, btn.closest('.rename-box').querySelector('input').value);
+      } else if (a === 'delete-image') {
+        deleteImage(btn.dataset.name);
+      } else if (a === 'restore-version') {
+        const host = (window._hostsByMac || {})[g.mac];
+        if (!host) { toast('That machine is not on the network', 'err'); return; }
+        openRestorePicker(host, btn, btn.dataset.name);
+      }
+    });
+  });
+
+  const editor = rows.querySelector('.rename-input');
+  if (editor) {
+    const g = groupByKey.get(renamingMac);
+    editor.focus();
+    editor.select();
+    editor.addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); commitRename(g, editor.value); }
+      if (e.key === 'Escape') { renamingMac = null; refreshBackups(); }
+    });
+  }
+}
+
+// ── disk strip ───────────────────────────────────────────────────────────
+let lastDriveHealth = null;
+
+function renderStorageBanner(banner, s) {
+  const h = lastDriveHealth;
+  if (h && h.ok && h.health === 'FAILED') {
+    banner.className = 'diskstrip bad';
+    banner.textContent = `⚠ Drive health FAILED — ${h.model || 'backup drive'}. Consider replacing it before data is lost.`;
+    return;
+  }
+  const parts = [`<span class="free">${s.free_gb} GB free</span>`, `of ${s.total_gb} GB`];
+  if (h && h.ok) {
+    if (h.model) parts.push(escapeHtml(h.model));
+    if (h.health === 'PASSED')       parts.push('SMART OK');
+    else if (h.health === 'UNKNOWN') parts.push('SMART unavailable');
+    if (h.temperature_c != null)     parts.push(`${h.temperature_c}°C`);
+    if (h.power_on_hours != null)    parts.push(`${h.power_on_hours.toLocaleString()} hrs on`);
+    if (h.nvme)                      parts.push(`${h.nvme.available_spare_pct}% spare`);
+  }
+  banner.className = 'diskstrip';
+  banner.innerHTML = parts.join('<span class="sep">·</span>');
+}
+
+async function refreshDriveHealth() {
+  try {
+    const r = await fetch('/api/drive-health');
+    if (!r.ok) return;
+    const h = await r.json();
+    lastDriveHealth = h.ok ? h : null;
+    const banner = document.getElementById('storageBanner');
+    const s = window._lastStorage;
+    if (s && s.ok) renderStorageBanner(banner, s);
+  } catch (e) { /* silent */ }
+}
+
+// ── add backup devices ───────────────────────────────────────────────────
 async function openAddDevicesPicker(btn) {
   const modal   = document.getElementById('addDevicesModal');
   const list    = document.getElementById('addDevicesList');
@@ -2212,8 +2715,8 @@ async function openAddDevicesPicker(btn) {
   const selAll  = document.getElementById('addDevicesSelectAll');
   const selPcs  = document.getElementById('addDevicesSelectPcs');
   const selNone = document.getElementById('addDevicesSelectNone');
-  sub.textContent = 'Scanning network…';
-  list.innerHTML = '<li class="muted">Please wait — running arp-scan on the subnet…</li>';
+  sub.textContent = 'Scanning the subnet — running arp-scan…';
+  list.innerHTML = '';
   confirm.disabled = true;
   modal.classList.add('show');
   const close = () => modal.classList.remove('show');
@@ -2233,30 +2736,30 @@ async function openAddDevicesPicker(btn) {
     discovered.sort((a, b) => rank(a.category) - rank(b.category) || ipKey(a.host).localeCompare(ipKey(b.host)));
     warnings = { replaced: d.replaced || [], removed: d.removed || [], moved: d.moved || [] };
   } catch (e) {
-    list.innerHTML = `<li class="muted">Scan failed: ${escapeHtml(e.message)}</li>`;
+    list.innerHTML = `<li class="empty">Scan failed: ${escapeHtml(e.message)}</li>`;
     sub.textContent = '';
     btn.disabled = false;
     return;
   } finally { btn.disabled = false; }
   if (!discovered.length) {
     sub.textContent = '';
-    list.innerHTML = '<li class="muted">No new devices discovered. Everything on the subnet is either already in the list or this host itself.</li>';
+    list.innerHTML = '<li class="empty">No new devices discovered. Everything on the subnet is either already in the list or this host itself.</li>';
   } else {
     sub.textContent = `Found ${discovered.length} device(s) not yet in the backup list. Tick the ones you want to back up.`;
     list.innerHTML = discovered.map((dev, i) => {
-      const badge = dev.category === 'pc' ? '<span class="cat-badge pc">PC</span>'
-                  : dev.category === 'nonpc' ? '<span class="cat-badge nonpc">non-PC</span>'
-                  : '<span class="cat-badge unknown">?</span>';
+      const badge = dev.category === 'pc' ? '<span class="tag pc">PC</span>'
+                  : dev.category === 'nonpc' ? '<span class="tag nonpc">non-PC</span>'
+                  : '<span class="tag unknown">?</span>';
       const safeName = escapeHtml(dev.name || '');
       return `
-        <li class="addDevices-row" data-i="${i}">
+        <li class="pick" data-i="${i}">
           <input type="checkbox" data-i="${i}">
-          <div class="info">
-            <div class="name">
+          <div class="opt-info">
+            <div class="opt-name">
               <input type="text" data-i="${i}" data-field="name" value="${safeName}">
               ${badge}
             </div>
-            <div class="meta">${escapeHtml(dev.host)} · ${escapeHtml(dev.mac)}${dev.vendor ? ' · ' + escapeHtml(dev.vendor) : ''}</div>
+            <div class="opt-meta">${escapeHtml(dev.host)} · ${escapeHtml(dev.mac)}${dev.vendor ? ' · ' + escapeHtml(dev.vendor) : ''}</div>
           </div>
         </li>`;
     }).join('');
@@ -2265,25 +2768,25 @@ async function openAddDevicesPicker(btn) {
       confirm.disabled = n === 0;
       confirm.textContent = n ? `Add ${n} selected` : 'Add selected';
     };
-    list.querySelectorAll('.addDevices-row').forEach(row => {
+    list.querySelectorAll('li.pick').forEach(row => {
       const cb = row.querySelector('input[type=checkbox]');
       row.addEventListener('click', e => {
         if (e.target.tagName === 'INPUT') return;  // let inputs handle themselves
         cb.checked = !cb.checked;
-        row.classList.toggle('checked', cb.checked);
+        row.classList.toggle('selected', cb.checked);
         updateConfirm();
       });
       cb.addEventListener('change', () => {
-        row.classList.toggle('checked', cb.checked);
+        row.classList.toggle('selected', cb.checked);
         updateConfirm();
       });
     });
     const setAll = (predicate) => {
-      list.querySelectorAll('.addDevices-row').forEach(row => {
+      list.querySelectorAll('li.pick').forEach(row => {
         const i = parseInt(row.dataset.i, 10);
         const cb = row.querySelector('input[type=checkbox]');
         cb.checked = predicate(discovered[i]);
-        row.classList.toggle('checked', cb.checked);
+        row.classList.toggle('selected', cb.checked);
       });
       updateConfirm();
     };
@@ -2322,7 +2825,7 @@ async function openAddDevicesPicker(btn) {
   }
   confirm.onclick = async () => {
     const picks = [];
-    list.querySelectorAll('.addDevices-row').forEach(row => {
+    list.querySelectorAll('li.pick').forEach(row => {
       const cb = row.querySelector('input[type=checkbox]');
       if (!cb.checked) return;
       const i = parseInt(row.dataset.i, 10);
@@ -2353,7 +2856,7 @@ async function openAddDevicesPicker(btn) {
 
 document.getElementById('addDevicesBtn').addEventListener('click', e => openAddDevicesPicker(e.currentTarget));
 
-// ── Software update ────────────────────────────────────────────────────────
+// ── software update ──────────────────────────────────────────────────────
 const updModal = document.getElementById('updateModal');
 const updForm  = document.getElementById('updateForm');
 const updLog   = document.getElementById('updateLog');
@@ -2445,10 +2948,11 @@ updStart.addEventListener('click', async () => {
     updLog.textContent = '';
     updSetView('log');
     updState.className = 'upd-state running';
-    updState.textContent = 'Starting update…';
+    updState.textContent = 'Connecting to the VPN…';
     if (!updTimer) updTimer = setInterval(updPoll, 2000);
   } catch (e) {
-    toast('Error: ' + e.message, 'err');
+    updState.className = 'upd-state err';
+    updState.textContent = e.message;
   } finally { updStart.disabled = false; }
 });
 
@@ -2468,116 +2972,18 @@ document.getElementById('updateClose').addEventListener('click', updCloseModal);
 updModal.addEventListener('click', e => { if (e.target === updModal) updCloseModal(); });
 document.getElementById('updateBtn').addEventListener('click', openUpdateModal);
 
-async function refreshBackups() {
-  try {
-    const r = await fetch('/api/images', { cache: 'no-store' });
-    const d = await r.json();
-    const rows = document.getElementById('backupRows');
-    if (!d.images.length) {
-      rows.innerHTML = '<tr><td colspan="5" class="muted">No backups yet.</td></tr>';
-      return;
-    }
-    rows.innerHTML = d.images.map(img => {
-      const hostCell = img.host_name
-        ? `${escapeHtml(img.host_name)} <span class="muted">(${escapeHtml(img.host_ip)})</span>`
-        : '<span class="muted">unmatched</span>';
-      const date = new Date(img.mtime * 1000).toLocaleString();
-      let sizeCell;
-      if (img.in_progress && img.estimated_percent != null) {
-        const pct = img.estimated_percent.toFixed(1);
-        sizeCell = `
-          <div class="progress">
-            <div class="bar"><div class="fill" style="width:${pct}%"></div></div>
-            <div class="label">${fmtBytes(img.size_bytes)} / ~${fmtBytes(img.reference_size)} · ${pct}%</div>
-          </div>`;
-      } else if (img.in_progress) {
-        sizeCell = `
-          <div class="progress indeterminate">
-            <div class="bar"><div class="fill"></div></div>
-            <div class="label">${fmtBytes(img.size_bytes)} · running (no prior backup for reference)</div>
-          </div>`;
-      } else {
-        sizeCell = fmtBytes(img.size_bytes);
-      }
-      return `
-        <tr>
-          <td>${hostCell}</td>
-          <td><span class="mac">${escapeHtml(img.name)}</span></td>
-          <td>${date}</td>
-          <td>${sizeCell}</td>
-          <td>
-            <select class="action" data-name="${escapeHtml(img.name)}">
-              <option value="">Action…</option>
-              <option value="delete">Delete</option>
-            </select>
-          </td>
-        </tr>`;
-    }).join('');
-    rows.querySelectorAll('select.action').forEach(sel => {
-      sel.addEventListener('change', async () => {
-        const name = sel.dataset.name;
-        const choice = sel.value;
-        sel.value = '';  // reset
-        if (choice === 'delete') {
-          if (!window.confirm(`Permanently delete image "${name}"? This cannot be undone.`)) return;
-          try {
-            const r = await fetch(`/api/images/${encodeURIComponent(name)}`, { method: 'DELETE' });
-            const d = await r.json();
-            if (!r.ok) throw new Error(d.detail || 'delete failed');
-            toast(`Deleted ${name}`, 'ok');
-            refreshBackups();
-            refresh();
-          } catch (err) { toast('Error: ' + err.message, 'err'); }
-        }
-      });
-    });
-  } catch (e) { /* silent */ }
-}
-
-let lastDriveHealth = null;
-
-function renderStorageBanner(banner, s) {
-  const h = lastDriveHealth;
-  let parts = [`${s.free_gb} GB free of ${s.total_gb} GB`];
-  if (h && h.ok) {
-    if (h.model)            parts.push(h.model);
-    if (h.health === 'FAILED') {
-      banner.className = 'banner err';
-      banner.textContent = `⚠ Drive health FAILED — ${h.model || 'backup drive'}. Consider replacing it before data is lost.`;
-      return;
-    }
-    if (h.health === 'PASSED')              parts.push('SMART OK');
-    else if (h.health === 'UNKNOWN')        parts.push('SMART unavailable');
-    if (h.temperature_c != null)            parts.push(`${h.temperature_c}°C`);
-    if (h.power_on_hours != null)           parts.push(`${h.power_on_hours.toLocaleString()} hrs on`);
-    if (h.nvme)                             parts.push(`${h.nvme.available_spare_pct}% spare`);
-  }
-  banner.className = 'banner ok-info';
-  banner.textContent = parts.join(' · ');
-}
-
-async function refreshDriveHealth() {
-  try {
-    const r = await fetch('/api/drive-health');
-    if (!r.ok) return;
-    const h = await r.json();
-    lastDriveHealth = h.ok ? h : null;
-    // Re-render storage banner if it's currently visible
-    const banner = document.getElementById('storageBanner');
-    const s = window._lastStorage;
-    if (s && s.ok) renderStorageBanner(banner, s);
-  } catch (e) { /* silent */ }
-}
-
+// ── boot ─────────────────────────────────────────────────────────────────
 fetch('/api/version').then(r => r.json()).then(d => {
-  document.getElementById('versionTag').textContent = 'v' + d.version;
+  document.getElementById('versionTag').textContent = ' · v' + d.version;
 }).catch(() => {});
 
 refresh();
 refreshBackups();
 refreshDriveHealth();
 setInterval(refresh, 5000);
-setInterval(refreshBackups, 5000);
+// Skip the periodic re-render while a name is being edited — it would replace
+// the input under the operator's cursor.
+setInterval(() => { if (renamingMac === null) refreshBackups(); }, 5000);
 setInterval(refreshDriveHealth, 60000);
 </script>
 </body>

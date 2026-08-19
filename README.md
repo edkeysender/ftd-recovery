@@ -99,7 +99,8 @@ curl -fsSL http://gitlab.ftdinternal.aero/ftd-supp/ftd_recovery/-/raw/main/updat
 
 The updater auto-detects the install prefix from the running service, installs
 any newly required system packages, and restarts `recovery-interface`. It never
-touches `hosts.yml`, `state.json`, fstab entries, network config, or backup data.
+touches `hosts.yml`, `state.json`, `machine_names.json`, fstab entries, network
+config, or backup data.
 
 ## Verifying the install
 
