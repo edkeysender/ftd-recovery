@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import json
 import os
 import re
@@ -115,11 +116,42 @@ def load_hosts() -> list[dict]:
     if not HOSTS_FILE.exists():
         return []
     data = yaml.safe_load(HOSTS_FILE.read_text()) or {}
-    return data.get("hosts", [])
+    hosts = data.get("hosts", [])
+    for h in hosts:
+        h["host"] = h.get("host") or ""  # MAC-only entries may omit it
+    return hosts
 
 
 def save_hosts(hosts: list[dict]) -> None:
     HOSTS_FILE.write_text(yaml.safe_dump({"hosts": hosts}, sort_keys=False))
+
+
+# An entry's IP is optional: a bare-metal PC (no OS yet) is added by MAC alone
+# so it can be armed for restore — PXE/dnsmasq/grub only ever look at the MAC.
+# Such entries are addressed by their MAC wherever the API takes a host key;
+# the next scan that sees the MAC fills the IP in (see "IP moves" in api_scan).
+
+def host_key(h: dict) -> str:
+    """The identifier the API and UI use for an entry: its IP, else its MAC."""
+    return h.get("host") or h.get("mac") or ""
+
+
+def find_host(hosts: list[dict], key: str) -> Optional[dict]:
+    """Look an entry up by IP, or by MAC (any notation)."""
+    for h in hosts:
+        if h.get("host") and h["host"] == key:
+            return h
+    try:
+        mac_n = normalize_mac(key)
+    except ValueError:
+        return None
+    for h in hosts:
+        try:
+            if h.get("mac") and normalize_mac(h["mac"]) == mac_n:
+                return h
+        except ValueError:
+            continue
+    return None
 
 
 # DHCP hostname cache written by recovery-dhcp-sniffer.service
@@ -857,10 +889,17 @@ def get_drive_health() -> dict:
 @app.get("/api/status")
 async def api_status():
     hosts = load_hosts()
+
+    async def _none():
+        return None
+
+    def probe(fn):
+        # MAC-only entries have no address to probe yet.
+        return asyncio.gather(*(fn(h["host"]) if h.get("host") else _none() for h in hosts),
+                              return_exceptions=True)
+
     ping_r, hn_r, arp_r = await asyncio.gather(
-        asyncio.gather(*(ping_host(h["host"]) for h in hosts), return_exceptions=True),
-        asyncio.gather(*(resolve_hostname(h["host"]) for h in hosts), return_exceptions=True),
-        asyncio.gather(*(arp_lookup(h["host"]) for h in hosts), return_exceptions=True),
+        probe(ping_host), probe(resolve_hostname), probe(arp_lookup),
     )
     state = load_state()
     state, expired = prune_expired(state)
@@ -881,8 +920,9 @@ async def api_status():
         armed = state["armed"].get(normalized) if normalized else None
         b = backups.get(normalized) if normalized else None
         out.append({
-            "name": h.get("name") or h["host"],
-            "host": h["host"],
+            "id": host_key(h),
+            "name": h.get("name") or host_key(h),
+            "host": h.get("host") or "",
             "hostname": hostname,
             "mac": normalized,
             "mac_source": "yaml" if h.get("mac") else ("arp" if mac else None),
@@ -1174,22 +1214,22 @@ async def update_machine_name(mac: str, payload: NameUpdate):
 @app.put("/api/host/{ip}/name")
 async def update_name(ip: str, payload: NameUpdate):
     hosts = load_hosts()
-    for h in hosts:
-        if h.get("host") == ip:
-            h["name"] = payload.name.strip() or h["host"]
-            save_hosts(hosts)
-            # Renaming the device renames its backup group too — same machine.
-            if h.get("mac"):
-                try:
-                    remember_machine_name(normalize_mac(h["mac"]), h["name"], "manual")
-                except ValueError:
-                    pass
-            return {"ok": True, "name": h["name"]}
-    raise HTTPException(status_code=404, detail="host not found")
+    h = find_host(hosts, ip)
+    if not h:
+        raise HTTPException(status_code=404, detail="host not found")
+    h["name"] = payload.name.strip() or host_key(h)
+    save_hosts(hosts)
+    # Renaming the device renames its backup group too — same machine.
+    if h.get("mac"):
+        try:
+            remember_machine_name(normalize_mac(h["mac"]), h["name"], "manual")
+        except ValueError:
+            pass
+    return {"ok": True, "name": h["name"]}
 
 
 class HostEntry(BaseModel):
-    host: str
+    host: str = ""  # empty = MAC-only entry (bare-metal PC, no address yet)
     mac: str
     name: Optional[str] = Field(default=None, max_length=64, pattern=_SAFE_NAME_PAT)
 
@@ -1202,13 +1242,14 @@ class HostBatchAdd(BaseModel):
 async def add_hosts(payload: HostBatchAdd):
     """Append selected discovered devices to the backup list.
 
-    Each entry needs ip + mac. Name defaults to dhcp-name or Unknown-XXXX.
-    Duplicates (matching ip or mac) are silently skipped.
+    Each entry needs a MAC; the IP is optional (a PC with no OS yet is added
+    by hand from the MAC on its sticker / BIOS / PXE screen). Name defaults to
+    dhcp-name or Unknown-XXXX. Duplicates (matching ip or mac) are skipped.
     """
     if not payload.hosts:
         return {"ok": True, "added": [], "skipped": []}
     hosts = load_hosts()
-    known_ips = {h.get("host") for h in hosts}
+    known_ips = {h["host"] for h in hosts if h.get("host")}
     known_macs = set()
     for h in hosts:
         if h.get("mac"):
@@ -1225,14 +1266,22 @@ async def add_hosts(payload: HostBatchAdd):
         except ValueError:
             skipped.append({"host": entry.host, "mac": entry.mac, "reason": "invalid MAC"})
             continue
-        if entry.host in known_ips or mac_n in known_macs:
-            skipped.append({"host": entry.host, "mac": mac_n, "reason": "already in list"})
+        ip = entry.host.strip()
+        if ip:
+            try:
+                ip = str(ipaddress.IPv4Address(ip))
+            except ValueError:
+                skipped.append({"host": entry.host, "mac": mac_n, "reason": "invalid IP"})
+                continue
+        if (ip and ip in known_ips) or mac_n in known_macs:
+            skipped.append({"host": ip, "mac": mac_n, "reason": "already in list"})
             continue
         name = _safe_name((entry.name or "").strip() or suggested_name(mac_n, dhcp_names)) or "Unknown"
-        new = {"name": name, "host": entry.host, "mac": mac_n}
+        new = {"name": name, "host": ip, "mac": mac_n}
         hosts.append(new)
         added.append(new)
-        known_ips.add(entry.host)
+        if ip:
+            known_ips.add(ip)
         known_macs.add(mac_n)
     if added:
         save_hosts(hosts)
@@ -1243,7 +1292,7 @@ async def add_hosts(payload: HostBatchAdd):
 async def remove_host(ip: str):
     """Remove a host from the backup list. Disarms it first if armed."""
     hosts = load_hosts()
-    target = next((h for h in hosts if h.get("host") == ip), None)
+    target = find_host(hosts, ip)
     if not target:
         raise HTTPException(status_code=404, detail="host not found")
     mac_n: Optional[str] = None
@@ -1263,18 +1312,19 @@ async def remove_host(ip: str):
                 print(f"[remove_host] allowlist remove failed for {mac_n}: {exc.stderr}")
             remove_grub_armed(mac_n)
             save_state(state)
-    hosts = [h for h in hosts if h.get("host") != ip]
+    hosts = [h for h in hosts if h is not target]
     save_hosts(hosts)
-    return {"ok": True, "removed": {"host": ip, "mac": mac_n, "name": target.get("name")}}
+    return {"ok": True, "removed": {"host": target.get("host") or "", "mac": mac_n,
+                                    "name": target.get("name")}}
 
 
 @app.post("/api/wake/{ip}")
 async def wake(ip: str):
     hosts = load_hosts()
-    target = next((h for h in hosts if h.get("host") == ip), None)
+    target = find_host(hosts, ip)
     if not target:
         raise HTTPException(status_code=404, detail="host not found")
-    mac = target.get("mac") or await arp_lookup(ip)
+    mac = target.get("mac") or (await arp_lookup(target["host"]) if target.get("host") else None)
     if not mac:
         raise HTTPException(status_code=400, detail="no MAC available (not in YAML, not in ARP table — try pinging the host first)")
     try:
@@ -1308,10 +1358,10 @@ def _resolve_mac_and_persist(target: dict, hosts: list[dict], arp_mac: Optional[
 @app.post("/api/host/{ip}/mode")
 async def arm_host(ip: str, payload: ArmRequest):
     hosts = load_hosts()
-    target = next((h for h in hosts if h.get("host") == ip), None)
+    target = find_host(hosts, ip)
     if not target:
         raise HTTPException(status_code=404, detail="host not found")
-    arp_mac = await arp_lookup(ip)
+    arp_mac = await arp_lookup(target["host"]) if target.get("host") else None
     try:
         mac = _resolve_mac_and_persist(target, hosts, arp_mac)
     except ValueError as e:
@@ -1344,7 +1394,7 @@ async def arm_host(ip: str, payload: ArmRequest):
         "mode": payload.mode,
         "armed_at": time.time(),
         "expires_at": expires_at,
-        "host_ip": ip,
+        "host_ip": host_key(target),
     }
     try:
         save_state(state)
@@ -1372,6 +1422,16 @@ async def disarm_host(ip: str):
     state = load_state()
     state, _ = prune_expired(state)
     macs = [m for m, e in state["armed"].items() if e.get("host_ip") == ip]
+    # Also by the entry's MAC: a MAC-only device that a scan has since given an
+    # IP was armed under its MAC key.
+    target = find_host(load_hosts(), ip)
+    if target and target.get("mac"):
+        try:
+            mac_n = normalize_mac(target["mac"])
+        except ValueError:
+            mac_n = None
+        if mac_n and mac_n in state["armed"] and mac_n not in macs:
+            macs.append(mac_n)
     for m in macs:
         del state["armed"][m]
         try:
@@ -1991,6 +2051,12 @@ INDEX_HTML = """<!doctype html>
                  font-family:var(--sans); font-size:13px; letter-spacing:normal; text-transform:none; }
   .field input:focus { outline:none; border-color:var(--blue); }
   .note { font-size:12px; color:var(--fg-dim); line-height:1.6; margin:0 0 16px; }
+  .manual-add { border-top:1px solid var(--line); padding-top:14px; margin:0 0 16px; }
+  .manual-add h3 { margin:0 0 4px; font-size:13px; font-weight:600; }
+  .manual-add .grid { display:grid; grid-template-columns:1.2fr 1fr 1fr auto; gap:8px; align-items:end; }
+  .manual-add .field { margin-bottom:0; }
+  .manual-add .grid > button { padding:8px 13px; font-size:13px; }
+  @media (max-width:640px) { .manual-add .grid { grid-template-columns:1fr; } }
   #updateLog { background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:11px 13px;
                margin:0 0 14px; max-height:44vh; min-height:130px; overflow:auto;
                font-family:var(--mono); font-size:11.5px; line-height:1.55; color:var(--fg-dim);
@@ -2068,6 +2134,24 @@ INDEX_HTML = """<!doctype html>
       <button id="addDevicesSelectNone" class="linkbtn">Clear</button>
     </div>
     <ul class="opts" id="addDevicesList"></ul>
+    <div class="manual-add">
+      <h3>Add by MAC address</h3>
+      <p class="note">For a PC that isn't on the network — e.g. a fresh disk with no OS, to restore an image onto.
+        The MAC is on the PC's sticker, in the BIOS network/LAN page, or on screen when it network-boots.
+        IP is optional; it's filled in once the PC shows up in a scan.</p>
+      <div class="grid">
+        <label class="field">MAC address
+          <input type="text" id="manualMac" placeholder="50:eb:f6:79:c5:54" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">Name
+          <input type="text" id="manualName" placeholder="optional" autocomplete="off" maxlength="64">
+        </label>
+        <label class="field">IP address
+          <input type="text" id="manualIp" placeholder="optional" autocomplete="off" spellcheck="false">
+        </label>
+        <button id="manualAddBtn" class="primary">Add</button>
+      </div>
+    </div>
     <div class="row">
       <button id="addDevicesCancel">Cancel</button>
       <button id="addDevicesConfirm" class="primary" disabled>Add selected</button>
@@ -2298,7 +2382,7 @@ async function openRestorePicker(host, btn, presetImage) {
   const sub     = document.getElementById('restoreModalSub');
   const confirm = document.getElementById('restoreConfirm');
   const cancel  = document.getElementById('restoreCancel');
-  sub.textContent = [host.name, host.host, host.mac || 'MAC unknown'].join(' · ');
+  sub.textContent = [host.name, host.host || 'no IP yet', host.mac || 'MAC unknown'].join(' · ');
   list.innerHTML = '<li class="empty">Loading…</li>';
   modal.classList.add('show');
   confirm.disabled = true;
@@ -2350,7 +2434,7 @@ async function openRestorePicker(host, btn, presetImage) {
   }
   confirm.onclick = () => {
     if (!selected) return;
-    const hostLabel = host.name || host.host;
+    const hostLabel = host.name || host.id;
     if (!window.confirm(
       'Arm RESTORE for ' + hostLabel + '\\n\\n' +
       'Image: ' + selected + '\\n\\n' +
@@ -2361,7 +2445,7 @@ async function openRestorePicker(host, btn, presetImage) {
       return;
     }
     close();
-    arm(host.host, 'recovery', btn, selected);
+    arm(host.id, 'recovery', btn, selected);
   };
 }
 
@@ -2381,7 +2465,7 @@ function buildActionsCell(h, storageOk) {
         <span class="pill ${m}" data-expires="${h.armed.expires_at}">
           ${verb} armed <span class="ttl">· ${fmtTtl(remaining)}</span>
         </span>
-        <button class="disarm" data-ip="${h.host}" data-action="disarm">Disarm</button>
+        <button class="disarm" data-ip="${escapeHtml(h.id)}" data-action="disarm">Disarm</button>
       </div>`;
   }
   const macAttr = h.mac ? '' : 'disabled title="No MAC known"';
@@ -2394,20 +2478,20 @@ function buildActionsCell(h, storageOk) {
     const verb = phase === 'restore' ? 'Restore' : (phase === 'backup' ? 'Backup' : 'Job');
     if (p.status === 'completed') {
       terminalBadge = `<span class="done-badge ok" title="${verb} completed">✓ ${verb} done</span>
-        <button class="icon" data-ip="${h.host}" data-mac="${h.mac || ''}" data-action="dismiss-progress" title="Dismiss">✕</button>`;
+        <button class="icon" data-ip="${escapeHtml(h.id)}" data-mac="${h.mac || ''}" data-action="dismiss-progress" title="Dismiss">✕</button>`;
     } else {
       const rc = p.rc != null ? ` (rc=${p.rc})` : '';
       terminalBadge = `<span class="done-badge err" title="${verb} failed${rc}">✗ ${verb} failed${rc}</span>
-        <button class="icon" data-ip="${h.host}" data-mac="${h.mac || ''}" data-action="dismiss-progress" title="Dismiss">✕</button>`;
+        <button class="icon" data-ip="${escapeHtml(h.id)}" data-mac="${h.mac || ''}" data-action="dismiss-progress" title="Dismiss">✕</button>`;
     }
   }
   return `
     <div class="actions">
       ${terminalBadge}
-      <button data-ip="${h.host}" data-action="wol"      ${macAttr}>Wake</button>
-      <button data-ip="${h.host}" data-action="recovery" ${macAttr}>Restore</button>
-      <button data-ip="${h.host}" data-action="backup"   ${backupAttr}>Backup</button>
-      <button class="icon danger" data-ip="${h.host}" data-action="remove" title="Remove from backup list">✕</button>
+      <button data-ip="${escapeHtml(h.id)}" data-action="wol"      ${macAttr}>Wake</button>
+      <button data-ip="${escapeHtml(h.id)}" data-action="recovery" ${macAttr}>Restore</button>
+      <button data-ip="${escapeHtml(h.id)}" data-action="backup"   ${backupAttr}>Backup</button>
+      <button class="icon danger" data-ip="${escapeHtml(h.id)}" data-action="remove" title="Remove from backup list">✕</button>
     </div>`;
 }
 
@@ -2435,7 +2519,7 @@ async function refresh() {
         const safeName = escapeHtml(h.name);
         const tag = h.category === 'pc'
           ? '<span class="tag pc" title="MAC vendor is a known PC NIC">PC</span>' : '';
-        const subBits = [h.host];
+        const subBits = [h.host || 'no IP yet'];
         if (h.mac) subBits.push(h.mac + (h.mac_source === 'arp' ? ' (arp)' : ''));
         else subBits.push('no MAC');
         if (h.latency_ms != null) subBits.push(h.latency_ms.toFixed(1) + ' ms');
@@ -2452,7 +2536,7 @@ async function refresh() {
                 <span class="dot" title="${h.online ? 'Online' : 'Offline'}"></span>
                 <div>
                   <div class="dev-name">
-                    <input class="name-edit" data-ip="${h.host}" data-original="${safeName}" value="${safeName}" title="${safeName}" size="1">${tag}
+                    <input class="name-edit" data-ip="${escapeHtml(h.id)}" data-original="${safeName}" value="${safeName}" title="${safeName}" size="1">${tag}
                   </div>
                   <div class="dev-sub">${escapeHtml(subBits.join(' · '))}</div>
                 </div>
@@ -2482,7 +2566,7 @@ async function refresh() {
           else if (a === 'remove') removeHost(ip, btn);
           else if (a === 'dismiss-progress') dismissProgress(btn.dataset.mac, btn);
           else if (a === 'recovery') {
-            const host = d.hosts.find(h => h.host === ip);
+            const host = d.hosts.find(h => h.id === ip);
             if (host) openRestorePicker(host, btn);
           }
           else arm(ip, a, btn);
@@ -2571,7 +2655,7 @@ function machineCellHtml(g) {
       </div>`;
   }
   const sub = g.on_network
-    ? `<div class="mach-sub">on the network · ${escapeHtml(g.host_ip || '')}</div>`
+    ? `<div class="mach-sub">on the network · ${escapeHtml(g.host_ip || 'no IP yet')}</div>`
     : '<div class="mach-sub off">not on the network · name kept from backup</div>';
   const renameBtn = g.mac
     ? `<button class="linkbtn" data-action="rename" data-key="${key}">rename</button>`
@@ -2835,7 +2919,7 @@ async function openAddDevicesPicker(btn) {
     if (warnings.moved.length) {
       parts.push('<strong>IP address changed — entries updated to follow the device:</strong>');
       parts.push(warnings.moved.map(r =>
-        `&nbsp;&nbsp;"${escapeHtml(r.name || r.mac)}": ${escapeHtml(r.old_host)} → ${escapeHtml(r.new_host)}`
+        `&nbsp;&nbsp;"${escapeHtml(r.name || r.mac)}": ${escapeHtml(r.old_host || "no IP")} → ${escapeHtml(r.new_host)}`
       ).join('<br>'));
     }
     if (warnings.replaced.length) {
@@ -2888,6 +2972,33 @@ async function openAddDevicesPicker(btn) {
 }
 
 document.getElementById('addDevicesBtn').addEventListener('click', e => openAddDevicesPicker(e.currentTarget));
+
+// Manual add: a PC that can't be scanned (no OS yet) is added by MAC alone.
+document.getElementById('manualAddBtn').addEventListener('click', async e => {
+  const btn = e.currentTarget;
+  const macIn = document.getElementById('manualMac');
+  const nameIn = document.getElementById('manualName');
+  const ipIn = document.getElementById('manualIp');
+  const hex = macIn.value.replace(/[^0-9a-fA-F]/g, '');
+  if (hex.length !== 12) { toast('MAC must be 12 hex digits, e.g. 50:eb:f6:79:c5:54', 'err'); macIn.focus(); return; }
+  const mac = hex.toLowerCase().match(/../g).join(':');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/hosts', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({hosts: [{ mac, host: ipIn.value.trim(), name: nameIn.value.trim() || null }]})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error((Array.isArray(d.detail) ? 'invalid name' : d.detail) || 'add failed');
+    if (d.skipped && d.skipped.length) throw new Error(`${d.skipped[0].mac || mac}: ${d.skipped[0].reason}`);
+    toast(`Added ${d.added[0].name} (${mac})`, 'ok');
+    macIn.value = nameIn.value = ipIn.value = '';
+    document.getElementById('addDevicesModal').classList.remove('show');
+    refresh();
+  } catch (err) { toast('Error: ' + err.message, 'err'); }
+  finally { btn.disabled = false; }
+});
 
 // ── software update ──────────────────────────────────────────────────────
 const updModal = document.getElementById('updateModal');
